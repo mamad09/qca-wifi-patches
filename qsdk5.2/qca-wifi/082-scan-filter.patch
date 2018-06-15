@@ -1,0 +1,326 @@
+In a very crowded environment (or due to malicious
+attacker) some scan entries may not fit into the
+limited buffer size of kernel -> userspace
+reports.
+
+This is important to establish backhaul
+connections with a fixed ssid name - hence allow
+driver to filter scan results that are fed to
+wpa_s.
+
+Example use:
+
+ iwpriv ath1 scanfilterssid MySSIDName
+ iwpriv ath1 gscanfilterssid
+ iwpriv ath1 scanfilter 0  # Disable filter
+ iwpriv ath1 scanfilter 1  # Include SSID results only
+ iwpriv ath1 scanfilter 2  # Include SSID results first, then the rest
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1489,6 +1489,8 @@ enum {
+     IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
+     IEEE80211_PARAM_LAST_BCN_RSSI,
+     IEEE80211_PARAM_LAST_ACK_RSSI,
++    IEEE80211_PARAM_SCAN_FILTER,
++    IEEE80211_PARAM_SCAN_FILTER_SSID,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+@@ -1980,6 +1982,13 @@ struct ieee80211_wlanconfig_wnm {
+     } data;
+ };
+ 
++/* scan filter values */
++typedef enum {
++    IEEE80211_SCAN_FILTER_DISABLED              = 0,
++    IEEE80211_SCAN_FILTER_ENABLED               = 1,
++    IEEE80211_SCAN_FILTER_FIRST                 = 2,
++} IEEE80211_SCAN_FILTER;
++
+ /* generic structure to support sub-ioctl due to limited ioctl */
+ typedef enum {
+     IEEE80211_WLANCONFIG_NOP,
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -1761,6 +1761,51 @@ int get_p2p_ie(const u8 *ies, u_int16_t
+ #endif /* ATH_SUPPORT_P2P */
+ #endif  /* SIOCGIWSCAN */
+ 
++static int
++get_filterssid(wlan_if_t vap, u_int8_t *ssid, u_int8_t *ssid_len, u_int8_t max_len)
++{
++    enum ieee80211_opmode   opmode = wlan_vap_get_opmode(vap);
++    ieee80211_ssid          ssidlist[1];
++    int                     len;
++
++    /* Check for configured SSID first */
++    len = strlen(vap->iv_scan_filter_ssid);
++    if (len > max_len) {
++        return -E2BIG;
++    }
++    else if (len > 0) {
++        *ssid_len = len;
++        OS_MEMCPY(ssid, vap->iv_scan_filter_ssid, len);
++        return 0;
++    }
++
++    /* No configured SSID for filtering: Use VAP ESSID */
++    if (opmode == IEEE80211_M_WDS) {
++        return -EOPNOTSUPP;
++    }
++
++    if (wlan_get_desired_ssidlist(vap, ssidlist, 1) <= 0) {
++        if (opmode == IEEE80211_M_HOSTAP) {
++            return -EOPNOTSUPP;
++        }
++        wlan_get_bss_essid(vap, ssidlist);
++    }
++
++    if (ssidlist[0].len > max_len) {
++        return -E2BIG;
++    }
++
++    *ssid_len = ssidlist[0].len;
++    OS_MEMCPY(ssid, ssidlist[0].ssid, ssidlist[0].len);
++    return 0;
++}
++
++typedef enum {
++    SCAN_FILTER_NONE        = 0,
++    SCAN_FILTER_INCLUDE,
++    SCAN_FILTER_EXCLUDE
++} scan_filter_t;
++
+ struct iwscanreq
+ {
+     struct net_device *dev;
+@@ -1770,6 +1815,10 @@ struct iwscanreq
+     int         mode;
+     struct iw_request_info *info;
+     bool        skip_2big;
++
++    u_int8_t      ssid[64];
++    u_int8_t      ssid_len;
++    scan_filter_t filter;
+ };
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION (2,6,27)
+@@ -1870,6 +1919,18 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+     if (current_ev >= end_buf) {
+         goto toobig;
+     }
++
++    if (req->filter != SCAN_FILTER_NONE) {
++        if (se_ssid_len == req->ssid_len && memcmp(se_ssid, &req->ssid, se_ssid_len) == 0) {
++            if (req->filter == SCAN_FILTER_EXCLUDE) {
++                return 0;
++            }
++        }
++        else if (req->filter == SCAN_FILTER_INCLUDE) {
++            return 0;
++        }
++    }
++
+     /* WPA/!WPA sort criteria */
+ 
+ 
+@@ -2454,6 +2515,20 @@ ieee80211_ioctl_giwscan(struct net_devic
+         req.skip_2big = false;
+     }
+ 
++    req.filter = SCAN_FILTER_NONE;
++    if (vap->iv_scan_filter != IEEE80211_SCAN_FILTER_DISABLED) {
++        if (get_filterssid(vap, req.ssid, &req.ssid_len, sizeof(req.ssid)) == 0) {
++            req.filter = SCAN_FILTER_INCLUDE;
++            req.mode = 0x3;
++            res = wlan_scan_table_iterate(vap, giwscan_cb, &req);
++            if (vap->iv_scan_filter == IEEE80211_SCAN_FILTER_ENABLED || res != 0) {
++                goto done;
++            }
++            req.filter = SCAN_FILTER_EXCLUDE;
++            req.mode = 0;
++        }
++    }
++
+     /*
+     * Do two passes to insure WPA/non-WPA scan candidates
+     * are sorted to the front.  This is a hack to deal with
+@@ -2491,6 +2566,8 @@ ieee80211_ioctl_giwscan(struct net_devic
+             res = 0;
+        }
+     }
++
++done:
+     data->length = req.current_ev - extra;
+ 
+     if (res != 0) {
+@@ -10535,8 +10612,35 @@ struct scanreq
+     size_t space;
+     struct ieee80211vap *vap;
+     u_int8_t scanreq_type;
++    u_int8_t ssid[64];
++    u_int8_t ssid_len;
++    scan_filter_t filter;
+ };
+ 
++static bool
++scan_result_ok(struct scanreq *req, wlan_scan_entry_t se)
++{
++    u_int8_t    ssid_len;
++    u_int8_t    *ssid;
++
++    if (req->filter == SCAN_FILTER_NONE || req->ssid_len == 0) {
++        return true;
++    }
++
++    ssid = wlan_scan_entry_ssid(se, &ssid_len);
++    if (ssid_len == req->ssid_len && memcmp(ssid, &req->ssid, ssid_len) == 0) {
++        if (req->filter == SCAN_FILTER_INCLUDE) {
++            return true;
++        }
++        return false;
++    }
++
++    if (req->filter == SCAN_FILTER_EXCLUDE) {
++        return true;
++    }
++    return false;
++}
++
+ static size_t
+ scan_space(wlan_scan_entry_t se, u_int16_t *ielen)
+ {
+@@ -10555,7 +10659,9 @@ get_scan_space(void *arg, wlan_scan_entr
+     struct scanreq *req = arg;
+     u_int16_t ielen;
+ 
+-    req->space += scan_space(se, &ielen);
++    if (scan_result_ok(req, se))
++        req->space += scan_space(se, &ielen);
++
+     return 0;
+ }
+ 
+@@ -10603,6 +10709,10 @@ get_scan_result(void *arg, wlan_scan_ent
+     u_int8_t *rates, *ssid, *bssid;
+     bool des_ssid_found = 0;
+ 
++    if (!scan_result_ok(req, se)) {
++        return 0;
++    }
++
+     len = scan_space(se, &ielen);
+     if (len > req->space)
+         return 0;
+@@ -10739,6 +10849,14 @@ ieee80211_ioctl_getscanresults(struct ne
+     req.vap = vap;
+     req.space = 0;
+     req.scanreq_type = SCANREQ_GIVE_ALL_SCAN_ENTRIES;
++    req.filter = SCAN_FILTER_NONE;
++    if (get_filterssid(vap, req.ssid, &req.ssid_len, sizeof(req.ssid)) < 0) {
++        req.ssid_len = 0;
++    }
++
++    if (vap->iv_scan_filter == IEEE80211_SCAN_FILTER_ENABLED) {
++        req.filter = SCAN_FILTER_INCLUDE;
++    }
+     if (vap->iv_ic->ic_repeater_move.state == REPEATER_MOVE_IN_PROGRESS) {
+         wlan_scan_table_iterate(vap, get_scan_space_rep_move, (void *) &req);
+     } else {
+@@ -10761,6 +10879,15 @@ ieee80211_ioctl_getscanresults(struct ne
+             return -ENOMEM;
+         req.sr = p;
+ 
++        if (vap->iv_scan_filter != IEEE80211_SCAN_FILTER_DISABLED) {
++            req.filter = SCAN_FILTER_INCLUDE;
++            wlan_scan_table_iterate(vap, get_scan_result, (void *)&req);
++
++            if (vap->iv_scan_filter == IEEE80211_SCAN_FILTER_FIRST) {
++                req.filter = SCAN_FILTER_EXCLUDE;
++                wlan_scan_table_iterate(vap, get_scan_result, (void *)&req);
++            }
++        } else /* if-else continued below */
+         if (space_exceeded) {
+             req.scanreq_type = SCANREQ_GIVE_ONLY_DESSIRED_SSID;
+             wlan_scan_table_iterate(vap, get_scan_result,(void *) &req);
+@@ -12852,6 +12979,11 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_IOCTL_GETPARAM,
+       IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | IEEE80211_ADDR_LEN,
+       IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | 12, "" },
++    { IEEE80211_IOCTL_SETPARAM,
++      IW_PRIV_TYPE_CHAR | 33, 0, "" },
++    { IEEE80211_IOCTL_GETPARAM,
++      0, IW_PRIV_TYPE_CHAR | 33, "" },
++
+     /*
+     * sub-ioctl definitions
+     *
+@@ -14403,6 +14535,14 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_LAST_ACK_RSSI,
+       IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | IEEE80211_ADDR_LEN,
+       IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | 12, "glastackrssi" },
++    { IEEE80211_PARAM_SCAN_FILTER,
++      IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scanfilter" },
++    { IEEE80211_PARAM_SCAN_FILTER, 0,
++      IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,    "gscanfilter" },
++    { IEEE80211_PARAM_SCAN_FILTER_SSID,
++      IW_PRIV_TYPE_CHAR | 33, 0, "scanfilterssid" },
++    { IEEE80211_PARAM_SCAN_FILTER_SSID, 0,
++      IW_PRIV_TYPE_CHAR | 33,    "gscanfilterssid" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -2906,6 +2906,8 @@ typedef struct ieee80211vap {
+     /* array to hold mac addr's for which mgmt frames will not be accepted */
+     struct ieee80211_mac       iv_conf_rej_mgmt[IEEE80211_REJECT_MGMT_MAX];
+     u_int8_t                   iv_csa_deauth;
++    u_int8_t                   iv_scan_filter;
++    char                       iv_scan_filter_ssid[IEEE80211_NWID_LEN+1];
+ } IEEE80211VAP, *PIEEE80211VAP;
+ 
+ #if QCN_IE
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2115,6 +2115,25 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+     case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
+         ic->ic_poll_q_util_interval_ms = value;
+         break;
++    case IEEE80211_PARAM_SCAN_FILTER:
++        switch (value) {
++        case IEEE80211_SCAN_FILTER_DISABLED:
++        case IEEE80211_SCAN_FILTER_ENABLED:
++        case IEEE80211_SCAN_FILTER_FIRST:
++            vap->iv_scan_filter = value;
++            retv = 0;
++            break;
++
++        default:
++            retv = -EINVAL;
++            break;
++        }
++        break;
++    case IEEE80211_PARAM_SCAN_FILTER_SSID:
++        memset(vap->iv_scan_filter_ssid, 0, sizeof(vap->iv_scan_filter_ssid));
++        strncpy(vap->iv_scan_filter_ssid, iwp->pointer, iwp->length);
++        retv = 0;
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+@@ -4408,6 +4427,14 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         *value = vap->iv_csa_deauth;
+         break;
++    case IEEE80211_PARAM_SCAN_FILTER:
++        *value = vap->iv_scan_filter;
++        break;
++    case IEEE80211_PARAM_SCAN_FILTER_SSID:
++        iwp->length = strlen(vap->iv_scan_filter_ssid)+1;
++        memcpy(iwp->pointer, vap->iv_scan_filter_ssid, iwp->length);
++        retv = 0;
++        break;
+     case IEEE80211_PARAM_LAST_BCN_RSSI:
+     {
+         struct ieee80211_node *ni;

@@ -1,0 +1,34 @@
+--- a/os/linux/tools/apstats.c
++++ b/os/linux/tools/apstats.c
+@@ -761,15 +761,22 @@ static int stats_hierachy_init(aplevel_s
+             return -ENOENT;
+         }
+ 
+-        if ((ret = nodestats_hierarchy_init(vapstats, sockfd)) < 0)
+-        {
+-            free(vapstats);
+-            sys_ifnames_deinit(&radio_listing);
+-            sys_ifnames_deinit(&vap_listing);
+-            if (ret == -EPERM)
+-               return 0;
+-            else
+-               return ret;
++        /* PIR-4300: "apstats" errors out if it hits STA vap. This prevented use
++         * of the command on nodes with AP+STA vaps.
++         *
++         * FIXME: Relying on netdev name sucks. Should check iftype.
++         */
++        if(!strstr(dev.ifr_name, "sta")) {
++            if ((ret = nodestats_hierarchy_init(vapstats, sockfd)) < 0)
++            {
++                free(vapstats);
++                sys_ifnames_deinit(&radio_listing);
++                sys_ifnames_deinit(&vap_listing);
++                if (ret == -EPERM)
++                   return 0;
++                else
++                   return ret;
++            }
+         }
+ 
+         vapstats->parent = curr_rs_ptr;

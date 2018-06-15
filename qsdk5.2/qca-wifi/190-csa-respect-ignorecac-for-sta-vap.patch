@@ -1,0 +1,42 @@
+DFS regulatory bodies (FCC, ETSI) require a CAC
+(channel assessment) to be performed before
+initiating radiation.
+
+For regular DFS channels it's 1 minute of passive
+listening for possible radar pulses. Weather
+channels require 10 minutes.
+
+Driver already allows ignoring CAC when starting
+up operation but it did not apply it for CSA to
+DFS channel -- this patch fixes it.
+
+Without the patch STA vap would lose connectivity
+and struggle connecting back (obviously).
+
+On qsdk52 this problem actually caused FW to crash
+Reason is unconfirmed but seems to have been
+associated with vdev_down, vdev_restart and
+vdev_up sequences likely confusing firmware and
+hitting an assertion failure.
+
+DISCLAIMER: This is for testing/demo purposes
+only. You may violate local law and fines may
+apply. You have been warned.
+--- a/umac/mlme/ieee80211_beacon.c
++++ b/umac/mlme/ieee80211_beacon.c
+@@ -1082,9 +1082,15 @@ ieee80211_beacon_update(struct ieee80211
+              *   takes care of the CAC automatically.
+              */
+ 
++            if (ic->ic_dfs_state.ignore_cac) {
++                printk("%s: ignoring cac\n", __func__);
++                goto ignore_cac;
++            }
++
+             if(!(IEEE80211_IS_CHAN_DFS(c) ||
+                         ((IEEE80211_IS_CHAN_11AC_VHT160(c) || IEEE80211_IS_CHAN_11AC_VHT80_80(c))
+                          && IEEE80211_IS_CHAN_DFS_CFREQ2(c)))) {
++ignore_cac:
+                 /* In Non-DFS case, do instant channel change in both
+                  * dependent and Idependent mode
+                  */

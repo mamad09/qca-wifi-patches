@@ -1,0 +1,98 @@
+qca-wifi-10.4: fix set raw MAC address for VIF
+
+Use the same logic to set mac address by no offloaded
+driver as offloaded. If macreq_enable is not set
+use raw MAC address without modification in the driver.
+
+This approach is needed to have full control of setting MAC
+address for VIFs. MAC request functionality assign different
+MAC address for STA depending on the order in which the
+interfaces were created, e.g.
+* wlanconfig bhaul-sta-50 create wlandev wifi1 wlanmode sta
+  bhaul-sta-50 60:B4:F7:00:7E:FA
+* wlanconfig bhaul-sta-50 destroy
+* wlanconfig bhaul-ap-50 create wlandev wifi1 wlanmode ap vapid 0
+  -bssid "42:B4:F7:00:7E:FA"
+* wlanconfig bhaul-sta-50 create wlandev wifi1 wlanmode sta
+  bhaul-sta-50 66:B4:F7:00:7E:FA
+
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -976,23 +976,42 @@ ath_vap_create(struct ieee80211com *ic,
+         }
+     } else
+ #endif
+     if ((flags & IEEE80211_CLONE_BSSID) == 0 ) {
+-        /* do not clone use the one passed in */
+-
+-        /* extract the id from the bssid */
+-        ATH_GET_VAP_ID(bssid, ic->ic_my_hwaddr, id);
+-        if ( (scn->sc_prealloc_idmask & (1 << id)) == 0) {
+-            /* the mac address was not pre allocated with ath_vap_alloc_macaddr */
+-            QDF_PRINT_INFO(ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "%s: the vap mac address was not pre allocated \n",__func__);
+-            return NULL;
+-        }
++        if (ic->ic_is_macreq_enabled(ic)) {
++            /* do not clone use the one passed in */
++
++            /* extract the id from the bssid */
++            ATH_GET_VAP_ID(bssid, ic->ic_my_hwaddr, id);
++            if ( (scn->sc_prealloc_idmask & (1 << id)) == 0) {
++                /* the mac address was not pre allocated with ath_vap_alloc_macaddr */
++                QDF_PRINT_INFO(ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "%s: the vap mac address was not pre allocated \n",__func__);
++                return NULL;
++            }
+ 
+-        IEEE80211_ADDR_COPY(myaddr,ic->ic_my_hwaddr);
+-        /* generate the mac address from id and sanity check */
+-        ATH_SET_VAP_BSSID(myaddr,ic->ic_my_hwaddr, id);
+-        if (!IEEE80211_ADDR_EQ(bssid,myaddr)) {
+-            QDF_PRINT_INFO(ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "%s: invalid (not locally administered) mac address was passed\n",__func__);
+-            return NULL;
++            IEEE80211_ADDR_COPY(myaddr,ic->ic_my_hwaddr);
++            /* generate the mac address from id and sanity check */
++            ATH_SET_VAP_BSSID(myaddr,ic->ic_my_hwaddr, id);
++            if (!IEEE80211_ADDR_EQ(bssid,myaddr)) {
++                QDF_PRINT_INFO(ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "%s: invalid (not locally administered) mac address was passed\n",__func__);
++                return NULL;
++            }
++        } else {
++            /* do not clone use the one passed in */
++            qdf_print("No cloning\n");
++            /*
++             * Added proper logic to get vap id and bssid value.
++             * when user pass BSSID MAC value through commandline using -bs     sid option, The
++             * exsiting logic won't work to get proper vap id to create VAP
++             */
++ 
++            for (id = 0; id < ATH_BCBUF; id++) {
++                /* get the first available slot */
++                if ((id_mask & (1 << id)) == 0) {
++                    break;
++                }
++            }
++            /* Update user passed BSSID value */
++            IEEE80211_ADDR_COPY(myaddr, bssid);
+         }
+     }
+ #if ATH_SUPPORT_WRAP
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -1156,8 +1156,12 @@ ath_vap_create(struct ieee80211com *ic,
+     scn->sc_ops->config_interface(scn->sc_dev, id, &ath_vap_config);
+ 
+     /* set up MAC address */
+-    ieee80211vap_get_macaddr(vap, myaddr);
+-    ATH_SET_VAP_BSSID(myaddr, wlan_vap_get_hw_macaddr((wlan_if_t)vap), id);
++    if ((flags & IEEE80211_CLONE_BSSID) == 0 && !ic->ic_is_macreq_enabled(ic)) {
++        IEEE80211_ADDR_COPY(myaddr, bssid);
++    } else {
++        ieee80211vap_get_macaddr(vap, myaddr);
++        ATH_SET_VAP_BSSID(myaddr, wlan_vap_get_hw_macaddr((wlan_if_t)vap), id);
++    }
+     ieee80211vap_set_macaddr(vap, myaddr);
+ 
+ #if ATH_SUPPORT_WRAP
+-- 
+2.7.4
+

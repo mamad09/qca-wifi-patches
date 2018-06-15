@@ -1,0 +1,78 @@
+STA CSA calls into iv_up() upon completion. This
+in turn performs internal re-association of the
+bss node.
+
+Due to the design (i.e. crypto-related corner case
+handling) bss node ended up being de-authorized
+internally preventing any traffic from flowing.
+
+Normally firmware implicitly enables internal data
+flow when peer association includes encryption
+flags. However vdev-restart is not a normal
+re-association as it does not involve re-keying of
+any sort.
+
+Ideally it'd be best to re-upload keys to firmware
+but that is highly non-trivial.
+
+Due to how symbols are distributed across the
+driver I split the patch into 2 different spots. I
+wanted to avoid exporting symbols.
+--- a/umac/base/ieee80211_vap_pause.c
++++ b/umac/base/ieee80211_vap_pause.c
+@@ -106,6 +106,10 @@ static void ieee80211_vap_resmgr_notific
+                 IEEE80211_DELIVER_EVENT_BEACON_MISS(vap);
+                 ic->ic_repeater_move.state = REPEATER_MOVE_IN_PROGRESS;
+             }
++
++            if (vap->iv_bss && vap->iv_opmode == IEEE80211_M_STA)
++                ieee80211_node_authorize(vap->iv_bss);
++
+             break;
+ 
+         default:
+--- a/offload/wlan/umac_offload_if/ol_if_resmgr.c
++++ b/offload/wlan/umac_offload_if/ol_if_resmgr.c
+@@ -401,6 +401,34 @@ ol_vdev_refresh_vdev_up(ol_scn_t scn,
+     }
+ }
+ 
++static void
++ol_if_resmgr_reauthorize(struct ieee80211com *ic, struct ieee80211vap *vap)
++{
++    struct ol_ath_softc_net80211 *scn = OL_ATH_SOFTC_NET80211(ic);
++    struct ol_ath_vap_net80211 *avn = OL_ATH_VAP_NET80211(vap);
++    struct ieee80211_node *ni;
++    int authorize = 1;
++    int err;
++
++    ni = vap->iv_bss;
++    if (!ni)
++        return;
++
++    if (!(ni->ni_flags & IEEE80211_NODE_AUTH))
++        return;
++
++    if (vap->iv_bss->ni_ucastkey.wk_keylen == 0)
++       return;
++
++    err = ol_ath_node_set_param(scn, ni->ni_macaddr, WMI_HOST_PEER_AUTHORIZE,
++                                authorize, avn->av_if_id);
++    if (err) {
++        printk("%s: failed to (re-)authorize %pM on %s: %d\n",
++               __func__, ni->ni_macaddr, vap->iv_netdev_name, err);
++        return;
++    }
++}
++
+ static int
+ ol_vdev_wmi_event_handler(ol_scn_t sc, u_int8_t *data, u_int16_t datalen)
+ {
+@@ -587,6 +615,7 @@ ol_vdev_wmi_event_handler(ol_scn_t sc, u
+ 
+             if (vdev_start_resp.resp_type == WMI_HOST_VDEV_RESTART_RESP_EVENT) {
+                 ieee80211_notify_vap_restart_complete(resmgr, vaphandle, IEEE80211_RESMGR_STATUS_SUCCESS);
++                ol_if_resmgr_reauthorize(ic, vaphandle);
+                 do_notify = false;
+             }
+ 

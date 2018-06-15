@@ -1,0 +1,143 @@
+This was added by Paul to solve some problems with
+STA vap association taking very long time due to
+vap indication logic interfering with what *we*
+want to do when it comes to roaming.
+
+The 10.4 no longer has the "vap_ind" itself so it
+lacks else-if cases that we relied on in Piranha
+(10.2). Originally the else-if cases were re-added
+kind of blindly and they seemed to had worked.
+
+However recently we've started seeing some
+problems in congested environments where STA vap
+scan would often fail to either detect the hidden
+ssid or fail to direct probe the AP candidate.
+
+For this reason scan parameters get more attention
+now, only bss channel is scanned and special
+handling is done for AP candidate direct probing
+to be more successful.
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -1223,6 +1223,30 @@ ieee80211_ioctl_iwaplist(struct net_devi
+ 
+ }
+ 
++void
++ieee80211_wireless_enh_ind_rpt_override_scan_params(
++        struct ieee80211com *ic,
++        ieee80211_scan_params *params,
++        u_int32_t *chan,
++        IEEE80211_SCAN_PRIORITY *prio)
++{
++    params->min_rest_time = 0;
++    params->max_rest_time = 0;
++    params->init_rest_time = 0;
++    params->type = IEEE80211_SCAN_REPEATER_BACKGROUND;
++
++    if (chan) {
++        *chan = ic->ic_curchan ? ic->ic_curchan->ic_ieee : IEEE80211_CHAN_ANY;
++        if (*chan != IEEE80211_CHAN_ANY) {
++            params->num_channels = 1;
++            params->chan_list = chan;
++        }
++    }
++
++    if (prio)
++        *prio = IEEE80211_SCAN_PRIORITY_HIGH;
++}
++
+ #ifdef SIOCGIWSCAN
+ static int
+ ieee80211_ioctl_siwscan(struct net_device *dev,
+@@ -1253,6 +1277,7 @@ ieee80211_ioctl_siwscan(struct net_devic
+ #endif
+     struct ieee80211_node   *ni = NULL;
+     int time_elapsed = OS_SIWSCAN_TIMEOUT;
++    u_int32_t vap_channel;
+ 
+     debug_print_ioctl(dev->name, SIOCSIWSCAN, "siwscan") ;
+     /*
+@@ -1535,6 +1560,12 @@ ieee80211_ioctl_siwscan(struct net_devic
+             scan_params->min_dwell_time_active = MIN_DWELL_TIME_ACTIVE ;
+             scan_params->max_dwell_time_active = MAX_DWELL_TIME_ACTIVE ;
+             scan_params->type = IEEE80211_SCAN_BACKGROUND;
++
++            ieee80211_wireless_enh_ind_rpt_override_scan_params(
++                    ic,
++                    scan_params,
++                    &vap_channel,
++                    &scan_priority);
+         } else if (osifp->sm_handle && wlan_connection_sm_is_connected(osifp->sm_handle)) {
+             scan_params->type = IEEE80211_SCAN_BACKGROUND;
+         } else {
+@@ -4334,6 +4365,7 @@ ieee80211_ioctl_p2p_big_param(struct net
+     struct ieee80211_node *ni =NULL;
+     struct ieee80211com *ic;
+     IEEE80211_SCAN_PRIORITY priority;
++    u_int32_t vap_channel;
+ 
+     if(vap == NULL)
+     {
+@@ -4604,6 +4636,12 @@ ieee80211_ioctl_p2p_big_param(struct net
+                 if (ic->ic_is_mode_offload(ic)) {
+                     priority = IEEE80211_SCAN_PRIORITY_HIGH;
+                 }
++
++                ieee80211_wireless_enh_ind_rpt_override_scan_params(
++                        ic,
++                        &scan_params,
++                        &vap_channel,
++                        &priority);
+         }
+         if (wlan_get_param(vap, IEEE80211_FEATURE_WDS) && !ieee80211_ic_enh_ind_rpt_is_set(vap->iv_ic)) {
+             /* For WDS station - always set the multiple_ports_active to false,
+@@ -10633,6 +10671,7 @@ ieee80211_ioctl_getscanresults(struct ne
+     static int count = 1;
+ #endif
+     bool space_exceeded = 0;
++    u_int32_t vap_channel;
+ 
+     debug_print_ioctl(dev->name, 0xffff, "getscanresults");
+ 
+@@ -10762,6 +10801,12 @@ ieee80211_ioctl_getscanresults(struct ne
+                 wlan_scan_table_flush(vap);
+             }
+ 
++            ieee80211_wireless_enh_ind_rpt_override_scan_params(
++                    ic,
++                    &scan_params,
++                    &vap_channel,
++                    NULL);
++
+             retv = wlan_scan_start(vap, &scan_params, osifp->scan_requestor, IEEE80211_SCAN_PRIORITY_LOW, &(osifp->scan_id));
+         }
+     }
+--- a/umac/sme/ieee80211_connection_sm.c
++++ b/umac/sme/ieee80211_connection_sm.c
+@@ -442,6 +442,12 @@ static void ieee80211_connection_state_s
+     u_int8_t          opt_ie[IEEE80211_OPTIE_MAX];
+     u_int32_t         length;
+     IEEE80211_SCAN_PRIORITY priority;
++    extern void ieee80211_wireless_enh_ind_rpt_override_scan_params(
++            struct ieee80211com *ic,
++            ieee80211_scan_params *params,
++            u_int32_t *chan,
++            IEEE80211_SCAN_PRIORITY *prio);
++    u_int32_t vap_channel;
+ 
+     /*
+      * if there is a bg scan in progress.
+@@ -491,6 +497,12 @@ static void ieee80211_connection_state_s
+         if (sm->vap_handle->iv_ic->ic_is_mode_offload(ic)) {
+             priority = IEEE80211_SCAN_PRIORITY_HIGH;
+         }
++
++        ieee80211_wireless_enh_ind_rpt_override_scan_params(
++                ic,
++                scan_params,
++                &vap_channel,
++                &priority);
+     } else {
+         scan_params->type = IEEE80211_SCAN_FOREGROUND;
+     }

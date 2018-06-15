@@ -1,0 +1,21 @@
+Vanilla 10.4 overrides userspace provided min/max
+channel time for passive scans. This caused
+off-chan survey scans to take much longer than
+requested. This could lead to degraded client
+performance because scans could interrupt traffic.
+
+The vap->max_dwell_time_passive is already used
+when min/max are not provided so this change
+should not impact any other use case.
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -1486,7 +1486,9 @@ ieee80211_ioctl_siwscan(struct net_devic
+         }
+ 
+         scan_params->type = IEEE80211_SCAN_FOREGROUND;
++#if 0
+ 	scan_params->max_dwell_time_passive  = (vap->max_dwell_time_passive > MAX_DWELL_TIME_PASSIVE ) ? MAX_DWELL_TIME_PASSIVE : vap->max_dwell_time_passive ;
++#endif
+ #if QCA_LTEU_SUPPORT
+         if (scan_num_channels > 0) {
+             scan_params->num_channels = scan_num_channels;

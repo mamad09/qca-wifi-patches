@@ -1,0 +1,21 @@
+Wext sub-ioctl allows for immediately,
+single-ioctl get+set as long as there is an
+adequate type/argument ghosting entry.
+
+The 12-byte argument is intended for ack and bcn
+rssi patches.
+
+Split for convenience in case only one of them is
+required to be ported.
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -12393,6 +12393,9 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_IOCTL_GETPARAM, 0,
+     IW_PRIV_TYPE_CHAR | IW_PRIV_SIZE_FIXED | (IEEE80211_ADDR_LEN * 2), "" },
+ 
++    { IEEE80211_IOCTL_GETPARAM,
++      IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | IEEE80211_ADDR_LEN,
++      IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | 12, "" },
+     /*
+     * sub-ioctl definitions
+     *

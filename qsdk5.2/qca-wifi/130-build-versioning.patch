@@ -1,0 +1,117 @@
+This is intended to allow runtime driver
+interrogation of compiled-in patches/features.
+
+If given driver setup uses QSDK/OpenWRT it is
+advised to call the ieee80211_versioning.sh from
+recipe Makefile - otherwise no versioning
+information will be available as by default quilt
+is not available within build dir (unless QUILT=1
+is set in environment which is typically a
+developer option).
+
+Driver will print out all versioning information
+that was generated to kernel log on:
+
+  iwpriv ath1 versioning 1
+
+Example output:
+ [ 8539.623000] versioning: item: sig=git-8e19b49
+ [ 8539.623000] versioning: item: date=Tue Jul  4 13:07:10 UTC 2017
+ [ 8539.623000] versioning: item: f33094b411faff8213ab47a0d26e102a  ./patches/001-plat-piranha-reduce-eth-link-bounces.patch
+ [ 8539.623000] versioning: item: 74d1383302e5cf9d0ae18aa61468ea19  ./patches/002-plat-piranha-panic-on-offload-crash.patch
+ [ 8539.623000] versioning: item: fd217ac8337df867df22320629dda3b0  ./patches/003-plat-piranha-ignore-cal-data-csum.patch
+ [ 8539.623000] versioning: item: 47ef41e60d0a30d7305dcddb0617e791  ./patches/004-build-fix-wmi-proto-warning.patch
+ ...
+ [ 8539.624000] versioning: cnt: 99
+--- /dev/null
++++ b/umac/base/ieee80211_versioning.sh
+@@ -0,0 +1,30 @@
++#!/bin/bash -x
++src=$(dirname "$(realpath "$0")")/ieee80211_versioning.c
++
++generate() {
++	printf 'const char *const versioning_strings[] = {\n'
++	tr -d '"' | sed 's/\\/\\\\/g' | xargs -d'\n' -n1 bash -c 'printf "\t\"%s\",\n" "$1"' -
++	printf '\tNULL,\n'
++	printf '};'
++}
++
++test -e "$src" || ( echo | generate > "$src")
++
++case "$1" in
++	git)
++		generate <<-. > "$src"
++			sig=git-$2
++			date=$(date --utc)
++			$(shift 2; md5sum "$@")
++		.
++		;;
++	quilt)
++		quilt --quiltrc - top >/dev/null || exit
++		generate <<-. > "$src"
++			sig=quilt-$(quilt --quiltrc - top)-$(quilt --quiltrc - diff | md5sum | cut -d' ' -f1)-$(quilt --quiltrc - diff -z | wc -l)
++			date=$(date --utc)
++			$(env QUILT_PATCHES_PREFIX=1 quilt --quiltrc - series | xargs -d'\n' md5sum)
++			$(quilt --quiltrc - files -al)
++		.
++		;;
++esac
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1494,6 +1494,7 @@ enum {
+     IEEE80211_PARAM_LAST_ACK_RSSI,
+     IEEE80211_PARAM_SCAN_FILTER,
+     IEEE80211_PARAM_SCAN_FILTER_SSID,
++    IEEE80211_PARAM_VERSIONING,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2134,6 +2134,25 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+         strncpy(vap->iv_scan_filter_ssid, iwp->pointer, iwp->length);
+         retv = 0;
+         break;
++    case IEEE80211_PARAM_VERSIONING:
++        {
++            extern const char *const versioning_strings[];
++            unsigned int cnt;
++            const char *const*str;
++
++            str = versioning_strings;
++            cnt = 0;
++
++            while (*str) {
++                printk("versioning: item: %s\n", *str);
++                str++;
++                cnt++;
++            }
++            printk("versioning: cnt: %u\n", cnt);
++
++            retv = 0;
++        }
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14571,6 +14571,7 @@ static const struct iw_priv_args ieee802
+       IW_PRIV_TYPE_CHAR | 33, 0, "scanfilterssid" },
+     { IEEE80211_PARAM_SCAN_FILTER_SSID, 0,
+       IW_PRIV_TYPE_CHAR | 33,    "gscanfilterssid" },
++    { IEEE80211_PARAM_VERSIONING, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "versioning" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/Kbuild
++++ b/umac/Kbuild
+@@ -349,6 +349,8 @@ umac-objs +=  p2p/ieee80211_notify_tx_bc
+ INCS += -I$(obj)/$(DEPTH)/umac/p2p
+ endif
+ 
++$(shell cd $(obj)/$(DEPTH)/umac/base && sh -x ieee80211_versioning.sh quilt)
++umac-objs += base/ieee80211_versioning.o
+ 
+ ifeq ($(ATH_EXT_AP), 1)
+ umac-objs += extap/ieee80211_mitbl.o extap/ieee80211_extap.o

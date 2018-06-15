@@ -1,0 +1,187 @@
+Some non-AP devices seem to end up not being able
+to proper ack aggregated traffic after CSA. This
+has been observed on 5G OL radio (Peregrine) with
+Linux hosted intel wireless chips (7265 for
+example).
+
+Symptoms were insanely large response time: ping
+>1s, tx sojourn stats >500ms, tx stats tons of
+attempts and ppdus with 0 successes:
+
+  64 bytes from 8.8.8.8: icmp_seq=1 ttl=47 time=1647 ms
+  64 bytes from 8.8.8.8: icmp_seq=2 ttl=47 time=1157 ms
+
+  HT / VHT:
+     bw | nss | mcs | rix |   attempts |    success |      ppdus
+  20MHz |   1 |   0 |  15 |   29051624 |          0 |    5528042
+
+  sojourn:
+       tid        ave                  sum num
+         0       2006            591602947 720918
+
+Triage showed disabling ampdu (iwpriv xxx ampdu 0)
+prevented the excessive retry problem. Based on
+this the patch has been prepared to temporarily
+tear down Tx AMPDU sessions for the duration of
+CSA and restore after completion.
+
+The restoration is not entirely robust and may
+generate new, more interesting interoperability
+bugs. Time will show.
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1502,6 +1502,7 @@ enum {
+     IEEE80211_PARAM_CSA_INTEROP_PHY,
+     IEEE80211_PARAM_CSA_INTEROP_BSS,
+     IEEE80211_PARAM_CSA_INTEROP_AUTH,
++    IEEE80211_PARAM_CSA_INTEROP_AGGR,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14593,6 +14593,8 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_RELAX_AMSDU, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "grelaxamsdu" },
+     { IEEE80211_PARAM_CSA_ORDERING, IW_PRIV_TYPE_CHAR | 33, 0, "csaordering" },
+     { IEEE80211_PARAM_CSA_ORDERING, 0, IW_PRIV_TYPE_CHAR | 33, "gcsaordering" },
++    { IEEE80211_PARAM_CSA_INTEROP_AGGR, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsainteropaggr" },
++    { IEEE80211_PARAM_CSA_INTEROP_AGGR, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsainteropaggr" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -2928,6 +2928,8 @@ typedef struct ieee80211vap {
+     u_int8_t                   iv_csa_interop_bss;
+     u_int8_t                   iv_csa_interop_bss_active;
+     u_int8_t                   iv_csa_interop_auth;
++    u_int8_t                   iv_csa_interop_aggr_enabled;
++    u_int8_t                   iv_csa_interop_aggr_active;
+ } IEEE80211VAP, *PIEEE80211VAP;
+ 
+ #if QCN_IE
+--- a/umac/mlme/ieee80211_beacon.c
++++ b/umac/mlme/ieee80211_beacon.c
+@@ -951,6 +951,90 @@ ieee80211_csa_interop_bss_is_desired(str
+     return desired;
+ }
+ 
++static int
++ieee80211_csa_interop_aggr_is_desired(struct ieee80211vap *vap)
++{
++    if (!vap->iv_csa_interop_aggr_enabled)
++        return 0;
++
++    if (vap->iv_ic->ic_flags & IEEE80211_F_CHANSWITCH)
++        return 1;
++
++    return 0;
++}
++
++static void
++ieee80211_csa_interop_aggr_update_iter(void *arg, wlan_node_t node)
++{
++    struct ieee80211_node *ni;
++    struct ieee80211vap *vap;
++    struct ieee80211com *ic;
++    int desired;
++    int bufsize;
++    int tid;
++
++    vap = arg;
++    ni = node;
++    ic = vap->iv_ic;
++    desired = ieee80211_csa_interop_aggr_is_desired(vap);
++    bufsize = (ni->ni_maxampdu+1) >> 14;
++
++    if (ic->ic_addba_clearresponse)
++        ic->ic_addba_clearresponse(ni);
++
++    printk("%s: node %pM %s aggr %d\n",
++           __func__,
++           ni->ni_macaddr,
++           desired ? "pausing" : "unpausing",
++           bufsize);
++
++    /* Note: OL radio can't turn back into AUTO aggregation mode once
++     * it enters MANUAL mode. Thus in order to get it back (and
++     * perormance along with it) it's necessary to explicitly request
++     * BA sessions on all tids.
++     *
++     * Also once MANUAL mode is entered existing BA sessions still
++     * need to be killed and prevented.
++     */
++    for (tid=0; tid<16; tid++) {
++        switch (desired) {
++            case 0:
++                if (ic->ic_addba_setresponse)
++                    ic->ic_addba_setresponse(ni, tid, 0);
++                if (ic->ic_addba_send)
++                    ic->ic_addba_send(ni, tid, bufsize);
++                break;
++            case 1:
++                if (ic->ic_addba_setresponse)
++                    ic->ic_addba_setresponse(ni, tid, 37);
++                if (ic->ic_delba_send)
++                    ic->ic_delba_send(ni, tid, 1, 37);
++                break;
++        }
++    }
++}
++
++static void
++ieee80211_csa_interop_aggr_update(struct ieee80211vap *vap)
++{
++    int desired;
++
++    desired = ieee80211_csa_interop_aggr_is_desired(vap);
++    if (desired == vap->iv_csa_interop_aggr_active)
++        return;
++
++    printk("%s: vap-%d %s %s\n",
++           __func__,
++           vap->iv_unit,
++           vap->iv_netdev_name,
++           desired ? "pausing" : "unpausing");
++
++    wlan_iterate_station_list(vap,
++                              ieee80211_csa_interop_aggr_update_iter,
++                              vap);
++    vap->iv_csa_interop_aggr_active = desired;
++}
++
+ /*
+  * Update the dynamic parts of a beacon frame based on the current state.
+  */
+@@ -1055,6 +1139,8 @@ ieee80211_beacon_update(struct ieee80211
+ 	vap->iv_update_vendor_ie = 0;
+     }
+ 
++    ieee80211_csa_interop_aggr_update(vap);
++
+     /* Check if channel change due to CW interference needs to be done.
+      * Since this is a drastic channel change, we do not wait for the TBTT interval to expair and
+      * do not send Channel change flag in beacon
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2117,6 +2117,10 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+         vap->iv_csa_interop_auth = !!value;
+         retv = 0;
+         break;
++    case IEEE80211_PARAM_CSA_INTEROP_AGGR:
++        vap->iv_csa_interop_aggr_enabled = !!value;
++        retv = 0;
++        break;
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         switch (value) {
+         case IEEE80211_CSA_DEAUTH_NONE:
+@@ -4496,6 +4500,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_CSA_INTEROP_AUTH:
+         *value = vap->iv_csa_interop_auth;
+         break;
++    case IEEE80211_PARAM_CSA_INTEROP_AGGR:
++        *value = vap->iv_csa_interop_aggr_enabled;
++        break;
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         *value = vap->iv_csa_deauth;
+         break;

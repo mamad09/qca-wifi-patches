@@ -1,0 +1,219 @@
+--- /dev/null
++++ b/include/ps_kapi.h
+@@ -0,0 +1,15 @@
++#ifndef _PS_KAPI_H
++#define _PS_KAPI_H
++
++struct ps_kapi_ctx {
++	struct ps_uapi_ioctl req;
++	spinlock_t lock;
++};
++
++int ps_kapi_init(struct ps_kapi_ctx *ctx);
++int ps_kapi_ioctl(struct net_device *dev,
++		  struct iw_request_info *info,
++		  union iwreq_data *wrqu,
++		  char *extra);
++
++#endif
+--- /dev/null
++++ b/lmac/ath_dev/ps.c
+@@ -0,0 +1,67 @@
++/* plume stats */
++
++#include <linux/types.h>
++#include <linux/bug.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
++# include <linux/export.h>
++#else
++# include <linux/module.h>
++#endif
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++#include <ieee80211_var.h>
++
++typedef int (*ps_kapi_ioctl_op)(struct net_device *dev,
++				struct iw_request_info *info,
++				union iwreq_data *wrqu,
++				char *extra,
++				struct ps_uapi_ioctl *cmd);
++
++static const ps_kapi_ioctl_op get_ops[PS_UAPI_IOCTL_CMD_MAX] = {
++};
++
++int ps_kapi_ioctl(struct net_device *dev,
++		  struct iw_request_info *info,
++		  union iwreq_data *wrqu,
++		  char *extra)
++{
++	struct ps_uapi_ioctl *cmd = (void *)extra;
++	struct ps_kapi_ctx *ctx;
++	struct ieee80211com *ic;
++
++	ic = ath_netdev_priv(dev);
++	ctx = &ic->ps_kapi_ctx;
++
++	switch (info->cmd) {
++	case PS_UAPI_IOCTL_SET:
++		if (cmd->cmd >= PS_UAPI_IOCTL_CMD_MAX ||
++		    !get_ops[cmd->cmd])
++			return -EOPNOTSUPP;
++
++		memcpy(&ctx->req, cmd, sizeof(*cmd));
++		return 0;
++	case PS_UAPI_IOCTL_GET:
++		memcpy(cmd, &ctx->req, sizeof(*cmd));
++
++		if (cmd->cmd >= PS_UAPI_IOCTL_CMD_MAX)
++			return -EOPNOTSUPP;
++
++		if (!get_ops[cmd->cmd])
++			return -EOPNOTSUPP;
++
++		return get_ops[cmd->cmd](dev, info, wrqu, extra, cmd);
++	}
++
++	return -EOPNOTSUPP;
++}
++EXPORT_SYMBOL(ps_kapi_ioctl);
++
++int ps_kapi_init(struct ps_kapi_ctx *ctx)
++{
++	spin_lock_init(&ctx->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(ps_kapi_init);
++
+--- a/offload/os/linux/ol_ath_iw_handler.c
++++ b/offload/os/linux/ol_ath_iw_handler.c
+@@ -48,6 +48,8 @@
+ #include "ol_regdomain.h"
+ #include <if_smart_ant.h>
+ #include <osif_private.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
+ 
+ #ifdef QCA_NSS_WIFI_OFFLOAD_SUPPORT
+ #include <osif_nss_wifiol_if.h>
+@@ -952,6 +954,18 @@ static const struct iw_priv_args ol_ath_
+ #endif
+     { OL_ATH_PARAM_THERM|OL_ATH_PARAM_SHIFT,  0,
+         IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,      "get_therm" },
++    {
++        .cmd = PS_UAPI_IOCTL_SET,
++        .set_args = PS_UAPI_IOCTL_PARAM,
++        .get_args = 0,
++        .name = PS_UAPI_IOCTL_SET_NAME,
++    },
++    {
++        .cmd = PS_UAPI_IOCTL_GET,
++        .set_args = 0,
++        .get_args = PS_UAPI_IOCTL_PARAM,
++        .name = PS_UAPI_IOCTL_GET_NAME,
++    },
+ };
+ 
+ 
+@@ -2058,6 +2072,9 @@ static const iw_handler ol_ath_iw_priv_h
+      (iw_handler) ol_ath_iw_get_peer_info,         /* SIOCWFIRSTPRIV+16 */
+ #endif
+      (iw_handler) ol_ath_iw_btcoex_duty_cycle,     /* SIOCWFIRSTPRIV+17 */
++
++    [PS_UAPI_IOCTL_SET_OFFSET] = (iw_handler) ps_kapi_ioctl,
++    [PS_UAPI_IOCTL_GET_OFFSET] = (iw_handler) ps_kapi_ioctl,
+ };
+ 
+ /*
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -6829,6 +6829,7 @@ ol_ath_dev_attach(struct ol_ath_softc_ne
+     spin_lock_init(&ic->ic_beacon_alloc_lock);
+ 
+     spin_lock_init(&ic->ic_state_check_lock);
++    ps_kapi_init(&ic->ps_kapi_ctx);
+ 
+     /* attach channel width management */
+     error = ol_ath_cwm_attach(scn);
+--- a/os/linux/src/ath_iw_handler.c
++++ b/os/linux/src/ath_iw_handler.c
+@@ -49,6 +49,8 @@
+ #include "ah.h"
+ #include "asf_amem.h"
+ #include "ath_ucfg.h"
++#include <ps_uapi.h>
++#include <ps_kapi.h>
+ 
+ #ifdef ATH_SUPPORT_HTC
+ static int ath_iw_wrapper_handler(struct net_device *dev,
+@@ -833,6 +835,18 @@ static const struct iw_priv_args ath_iw_
+         0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,    "g_wb_subelem" },
+     { ATH_PARAM_THERM|ATH_PARAM_SHIFT,  0,
+         IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,      "get_therm" },
++    {
++        .cmd = PS_UAPI_IOCTL_SET,
++        .set_args = PS_UAPI_IOCTL_PARAM,
++        .get_args = 0,
++        .name = PS_UAPI_IOCTL_SET_NAME,
++    },
++    {
++        .cmd = PS_UAPI_IOCTL_GET,
++        .set_args = 0,
++        .get_args = PS_UAPI_IOCTL_PARAM,
++        .name = PS_UAPI_IOCTL_GET_NAME,
++    },
+ };
+ 
+ /******************************************************************************/
+@@ -1832,6 +1846,9 @@ static const iw_handler ath_iw_priv_hand
+     (iw_handler) ath_iw_set_saparam,         /* SIOCWFIRSTPRIV+10 */
+     (iw_handler) ath_iw_get_saparam,         /* SIOCWFIRSTPRIV+11 */
+ #endif
++
++    [PS_UAPI_IOCTL_SET_OFFSET] = (iw_handler) ps_kapi_ioctl,
++    [PS_UAPI_IOCTL_GET_OFFSET] = (iw_handler) ps_kapi_ioctl,
+ };
+ 
+ /*
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -8828,6 +8828,7 @@ ath_attach(u_int16_t devid, void *base_a
+     spin_lock_init(&ic->ic_main_sta_lock);
+     spin_lock_init(&ic->ic_addba_lock);
+     IEEE80211_STATE_LOCK_INIT(ic);
++    ps_kapi_init(&ic->ps_kapi_ctx);
+     spin_lock_init(&ic->ic_beacon_alloc_lock);
+     spin_lock_init(&ic->ic_state_check_lock);
+ #ifndef REMOVE_PKT_LOG
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -90,6 +90,10 @@
+ 
+ #include <sys/queue.h>
+ 
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ #define IEEE80211_TXPOWER_MAX        100   /* .5 dbM (XXX units?) */
+ #define IEEE80211_TXPOWER_MIN        0     /* kill radio */
+ 
+@@ -1835,6 +1839,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     u_int32_t                           ic_auth_tx_xretry;
+     int                                 (*ic_get_therm)(struct ieee80211com *ic, int *signal_dbm);
+     int                                 (*ic_cc_clk_khz)(struct ieee80211com *ic);
++    struct ps_kapi_ctx                  ps_kapi_ctx;
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ typedef  int  (* ieee80211_vap_input_mgmt_filter ) (struct ieee80211_node *ni, wbuf_t wbuf,
+--- a/umac/Kbuild
++++ b/umac/Kbuild
+@@ -276,6 +276,7 @@ umac-objs := base/ieee80211_ucfg.o \
+              admctl/ieee80211_admctl.o admctl/ieee80211_admctl_ap.o \
+              wnm/ieee80211_wnm.o wnm/ieee80211_wnm_ap.o wnm/ieee80211_wnm_sta.o\
+              vi_dbg/ieee80211_vi_dbg.o \
++             $(DEPTH)/lmac/ath_dev/ps.o \
+              base/ieee80211_node_proxyarp.o $(OSDEP_SRC)/osif_proxyarp.o \
+              smart_ant/ieee80211_smart_ant_api.o \
+              $(OSDEP_SRC)/ath_wbuf.o \

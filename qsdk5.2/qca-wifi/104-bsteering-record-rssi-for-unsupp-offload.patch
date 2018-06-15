@@ -1,0 +1,15 @@
+--- a/offload/wlan/lmac_offload_if/ol_if_stats.c
++++ b/offload/wlan/lmac_offload_if/ol_if_stats.c
+@@ -898,7 +898,11 @@ ol_ath_update_stats_event_handler(ol_scn
+                             rssi_changed = true;
+                         }
+                     } else {
+-                        if (peer_stats->peer_rssi && peer_stats->peer_rssi_changed) {
++
++                        /* Firmware may not support peer_rssi_changed itself, but
++                         * peer_rssi is still reported (not averaged, but still).
++                         */
++                        if (peer_stats->peer_rssi && (1 || peer_stats->peer_rssi_changed)) {
+                             /* New RSSI measurement */
+                             ieee80211_bsteering_record_rssi(ni, peer_stats->peer_rssi);
+                             rssi_changed = true;

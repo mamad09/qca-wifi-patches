@@ -1,0 +1,156 @@
+--- a/umac/acl/ieee80211_acl.c
++++ b/umac/acl/ieee80211_acl.c
+@@ -85,6 +85,11 @@ struct ieee80211_acl_entry
+      * future).
+      */
+     u_int8_t                             ae_flags;
++
++    /*
++     * Parameters specific to this entry.
++     */
++    u_int8_t                             params[IEEE80211_ACL_PARAM_MAX];
+ };
+ struct ieee80211_acl
+ {
+@@ -301,6 +306,109 @@ ieee80211_acl_set_flag(wlan_if_t vap, co
+         }
+         spin_unlock(&acl->acl_lock);
+     }
++
++    return retval;
++}
++
++int
++ieee80211_acl_set_param(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                        enum ieee80211_acl_param param, u_int8_t val)
++{
++    struct ieee80211_acl_entry  *entry;
++    ieee80211_acl_t             acl = vap->iv_acl;
++    int                         retval = -ENOENT;
++
++    if (param < 0 || param >= IEEE80211_ACL_PARAM_MAX) {
++        return -EINVAL;
++    }
++
++    if (acl) {
++        spin_lock(&acl->acl_lock);
++        entry = _find_acl(acl, mac);
++        if (entry) {
++            entry->params[param] = val;
++            retval = EOK;
++        }
++        spin_unlock(&acl->acl_lock);
++    }
++
++    return retval;
++}
++
++int
++ieee80211_acl_set_param_and_flag(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                                 enum ieee80211_acl_flag flag,
++                                 enum ieee80211_acl_param param, u_int8_t val)
++{
++    struct ieee80211_acl_entry  *entry;
++    ieee80211_acl_t             acl = vap->iv_acl;
++    int                         retval = -ENOENT;
++
++    if (param < 0 || param >= IEEE80211_ACL_PARAM_MAX) {
++        return -EINVAL;
++    }
++
++    if (acl) {
++        spin_lock(&acl->acl_lock);
++        entry = _find_acl(acl, mac);
++        if (entry) {
++            entry->ae_flags |= flag;
++            entry->params[param] = val;
++            retval = EOK;
++        }
++        spin_unlock(&acl->acl_lock);
++    }
++
++    return retval;
++}
++
++int
++ieee80211_acl_get_param(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                        enum ieee80211_acl_param param, u_int8_t *val)
++{
++    struct ieee80211_acl_entry  *entry;
++    ieee80211_acl_t             acl = vap->iv_acl;
++    int                         retval = -ENOENT;
++
++    if (param < 0 || param >= IEEE80211_ACL_PARAM_MAX) {
++        return -EINVAL;
++    }
++
++    if (acl) {
++        spin_lock(&acl->acl_lock);
++        entry = _find_acl(acl, mac);
++        if (entry) {
++            *val = entry->params[param];
++            retval = EOK;
++        }
++        spin_unlock(&acl->acl_lock);
++    }
++
++    return retval;
++}
++
++int
++ieee80211_acl_get_param_if_flag(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                                enum ieee80211_acl_flag flag,
++                                enum ieee80211_acl_param param, u_int8_t *val)
++{
++    struct ieee80211_acl_entry  *entry;
++    ieee80211_acl_t             acl = vap->iv_acl;
++    int                         retval = 0;
++
++    if (param < 0 || param >= IEEE80211_ACL_PARAM_MAX) {
++        return 0;
++    }
++
++    if (acl) {
++        spin_lock(&acl->acl_lock);
++        entry = _find_acl(acl, mac);
++        if (entry && ((entry->ae_flags & flag) == flag)) {
++            *val = entry->params[param];
++            retval = 1;
++        }
++        spin_unlock(&acl->acl_lock);
++    }
+ 
+     return retval;
+ }
+--- a/umac/include/ieee80211_acl.h
++++ b/umac/include/ieee80211_acl.h
+@@ -46,6 +46,29 @@ ieee80211_acl_set_flag(wlan_if_t vap, co
+ int
+ ieee80211_acl_clr_flag(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
+                        enum ieee80211_acl_flag flag);
++
++/**
++ * @brief Special parameters that can be used by the band steering module (and
++ *        potentially others in the future) on individual ACL entries.
++ */
++enum ieee80211_acl_param {
++    IEEE80211_ACL_PARAM_MAX
++};
++
++int
++ieee80211_acl_set_param(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                        enum ieee80211_acl_param param, u_int8_t val);
++int
++ieee80211_acl_set_param_and_flag(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                                enum ieee80211_acl_flag flag,
++                                enum ieee80211_acl_param param, u_int8_t val);
++int
++ieee80211_acl_get_param(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                        enum ieee80211_acl_param param, u_int8_t *val);
++int
++ieee80211_acl_get_param_if_flag(wlan_if_t vap, const u_int8_t mac[IEEE80211_ADDR_LEN],
++                                enum ieee80211_acl_flag flag,
++                                enum ieee80211_acl_param param, u_int8_t *val);
+ #endif
+ 
+ #else /* UMAC_SUPPORT_ACL */

@@ -1,0 +1,89 @@
+Normally iwpriv isn't expected to do oversized
+sub-ioctls that are carried over using iw_point.
+
+This only prepares for handling them by fixing up
+the param stuff for switch-case. Subsequently
+added oversize sub-ioctls will need to be aware
+they are oversized and use ioctl arguments
+appropriately.
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -4285,10 +4285,16 @@ static int ieee80211_ioctl_setparam(stru
+ {
+     osif_dev  *osifp = ath_netdev_priv(dev);
+     wlan_if_t vap = osifp->os_if;
++    struct iw_point *iwp = w;
+     int *i = (int *) extra;
+     int param = i[0];       /* parameter id is 1st */
+     int value = i[1];       /* NB: most values are TYPE_INT */
+ 
++    if (param & ~0xffff) {
++        param = iwp->flags;
++        extra = w;
++    }
++
+     debug_print_ioctl(dev->name, param, find_ieee_priv_ioctl_name(param, 1));
+ 
+     return ieee80211_ucfg_setparam(vap, param, value, extra);
+@@ -5643,13 +5649,20 @@ int ieee80211_ioctl_getparam(struct net_
+ {
+     osif_dev *osifp = ath_netdev_priv(dev);
+     wlan_if_t vap = osifp->os_if;
+-    int *param = (int *) extra;
++    struct iw_point *iwp = w;
++    int *value = (int *) extra;
++    int param = *value;
++
++    if (param & ~0xffff) {
++        param = iwp->flags;
++        value = (void *)w;
++    }
+ 
+-    debug_print_ioctl(dev->name, param[0], find_ieee_priv_ioctl_name(param[0], 0));
++    debug_print_ioctl(dev->name, param, find_ieee_priv_ioctl_name(param, 0));
+     IEEE80211_DPRINTF(vap, IEEE80211_MSG_IOCTL,
+-            "%s parameter is 0x%x\n", __func__, param[0]);
++            "%s parameter is 0x%x\n", __func__, param);
+ 
+-    return ieee80211_ucfg_getparam(vap, *param, param);
++    return ieee80211_ucfg_getparam(vap, param, value);
+ }
+ 
+ /**
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -970,6 +970,7 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+     int prev_state = 0;
+     int new_state = 0;
+     int *val = (int*)extra;
++    struct iw_point *iwp = (void *)extra;
+     int deschan;
+     int basic_valid_mask = 0;
+     struct _rate_table {
+@@ -987,6 +988,8 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+     int i;
+ #endif
+ 
++    (void)iwp;
++
+     if (osifp->is_delete_in_progress)
+         return -EINVAL;
+ 
+@@ -3939,6 +3942,7 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     osif_dev  *osifp = (osif_dev *)wlan_vap_get_registered_handle(vap);
+     wlan_dev_t ic = wlan_vap_get_devhandle(vap);
+     char *extra = (char *)value;
++    struct iw_point *iwp = (void *)value;
+     int retv = 0;
+     int *txpow_frm_subtype = value;
+     u_int8_t frame_subtype;
+@@ -3946,6 +3950,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+ #if ATH_SUPPORT_DFS
+     int tmp;
+ #endif
++
++    (void)iwp;
++
+ 	if (!osifp || osifp->is_delete_in_progress)
+ 		return -EINVAL;
+ 

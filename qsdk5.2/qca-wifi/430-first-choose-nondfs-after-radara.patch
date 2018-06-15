@@ -1,0 +1,16 @@
+In case we detect RADAR first prefer non-dfs cahnnels
+
+diff --git a/umac/dfs/ieee80211_dfs.c b/umac/dfs/ieee80211_dfs.c
+index 05ca770..9324fc1 100755
+--- a/umac/dfs/ieee80211_dfs.c
++++ b/umac/dfs/ieee80211_dfs.c
+@@ -1804,6 +1804,9 @@ ieee80211_dfs_attach(struct ieee80211com *ic)
+ 	ATH_CREATE_WORK(&ic->dfs_cac_timer_start_work,ieee80211_dfs_cac_timer_start_async,(void *)ic);
+ 
+ 	ic->ic_set_quiet = null_set_quiet;
++
++        /* First choose NONDFS when RADAR detected */
++        IEEE80211_CSH_NONDFS_RANDOM_ENABLE(ic);
+ }
+ 
+ /*

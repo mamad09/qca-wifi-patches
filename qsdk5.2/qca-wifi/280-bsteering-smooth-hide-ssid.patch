@@ -1,0 +1,130 @@
+Stock driver restarts the VAP upon changing hide
+ssid update which implies all stations are
+disconnected.
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -2142,6 +2142,7 @@ enum {
+     IEEE80211_EV_MESH_PEER_TIMEOUT,
+ #endif
+     IEEE80211_EV_UNPROTECTED_DEAUTH_IND_STA,
++    IEEE80211_EV_HIDE_SSID_UPDATE,
+ };
+ 
+ #endif /* __linux__ */
+--- a/include/_ieee80211.h
++++ b/include/_ieee80211.h
+@@ -762,4 +762,8 @@ u_int8_t ieee80211_sec_chan_offset(struc
+ #define ATF_AIRTIME_BASED                    1
+ #define ATF_TPUT_BASED                       2
+ 
++struct ieee80211_hide_ssid_update_ev {
++    int enabled;
++};
++
+ #endif /* __NET80211__IEEE80211_H_ */
+--- a/os/linux/tools/wifitool.c
++++ b/os/linux/tools/wifitool.c
+@@ -2205,6 +2205,13 @@ get_next_wireless_custom_event(void *eve
+                                         printf("MU_percent=%d\n",mu_rpt->mu_database_entries[i].mu_percentage);
+                                     }
+                                     done = 1;
++                                } else if (iwe.u.data.flags == IEEE80211_EV_HIDE_SSID_UPDATE &&
++                                        iwe.u.data.length >= sizeof(struct ieee80211_hide_ssid_update_ev)) {
++                                    struct ieee80211_hide_ssid_update_ev *ev;
++
++                                    ev = (void *)data;
++                                    printf("hide_ssid_update %d %s\n", ev->enabled, ifname);
++                                    fflush(NULL);
+                                 }
+                             }
+                         }
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -2930,6 +2930,7 @@ typedef struct ieee80211vap {
+     u_int8_t                   iv_csa_interop_auth;
+     u_int8_t                   iv_csa_interop_aggr_enabled;
+     u_int8_t                   iv_csa_interop_aggr_active;
++    u_int8_t                   iv_hide_ssid_state;
+ } IEEE80211VAP, *PIEEE80211VAP;
+ 
+ #if QCN_IE
+--- a/umac/mlme/ieee80211_beacon.c
++++ b/umac/mlme/ieee80211_beacon.c
+@@ -1035,6 +1035,56 @@ ieee80211_csa_interop_aggr_update(struct
+     vap->iv_csa_interop_aggr_active = desired;
+ }
+ 
++static void
++ieee80211_beacon_update_h_hide_ssid_send_ev(struct ieee80211vap *vap)
++{
++    struct ieee80211_hide_ssid_update_ev ev;
++    struct net_device *dev;
++    union iwreq_data wreq;
++    const char *name;
++
++    memset(&wreq, 0, sizeof(wreq));
++    memset(&ev, 0, sizeof(ev));
++
++    wreq.data.flags = IEEE80211_EV_HIDE_SSID_UPDATE;
++    wreq.data.length = sizeof(ev);
++    ev.enabled = vap->iv_hide_ssid_state;
++
++    rcu_read_lock();
++    name = vap->iv_netdev_name;
++    dev = dev_get_by_name_rcu(&init_net, name);
++    if (dev)
++        WIRELESS_SEND_EVENT(dev, IWEVCUSTOM, &wreq, (void *)&ev);
++    rcu_read_unlock();
++}
++
++static void
++ieee80211_beacon_update_h_hide_ssid(struct ieee80211vap *vap,
++                                    struct ieee80211_node *ni,
++                                    struct ieee80211_beacon_offsets *bo,
++                                    wbuf_t wbuf,
++                                    bool *update_beacon_copy)
++{
++    u_int8_t *frm;
++    int enabled;
++
++    enabled = IEEE80211_VAP_IS_HIDESSID_ENABLED(vap) ? 1 : 0;
++    if (vap->iv_hide_ssid_state == enabled)
++        return;
++
++    vap->iv_hide_ssid_state = enabled;
++    ieee80211_beacon_update_h_hide_ssid_send_ev(vap);
++
++    if (*update_beacon_copy)
++        return;
++
++    frm = (u_int8_t *)wbuf_header(wbuf) + sizeof(struct ieee80211_frame);
++    frm = ieee80211_beacon_init(ni, bo, frm);
++    *update_beacon_copy = true;
++    wbuf_set_pktlen(wbuf, (frm - (u_int8_t *)wbuf_header(wbuf)));
++}
++                                    
++
+ /*
+  * Update the dynamic parts of a beacon frame based on the current state.
+  */
+@@ -1164,6 +1214,8 @@ ieee80211_beacon_update(struct ieee80211
+         if ( ic->cw_inter_found) ic->cw_inter_found = 0;
+     }
+ 
++    ieee80211_beacon_update_h_hide_ssid(vap, ni, bo, wbuf, &update_beacon_copy);
++
+     IEEE80211_CHAN_CHANGE_LOCK(ic);
+     if (!IEEE80211_CHANCHANGE_STARTED_IS_SET(ic) && (ic->ic_flags & IEEE80211_F_CHANSWITCH)) {
+         IEEE80211_CHANCHANGE_STARTED_SET(ic);
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -1336,9 +1336,6 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+         break;
+     case IEEE80211_PARAM_HIDESSID:
+         retv = wlan_set_param(vap, IEEE80211_FEATURE_HIDE_SSID, value);
+-        if (retv == EOK) {
+-            retv = ENETRESET;
+-        }
+         break;
+     case IEEE80211_PARAM_APBRIDGE:
+         retv = wlan_set_param(vap, IEEE80211_FEATURE_APBRIDGE, value);

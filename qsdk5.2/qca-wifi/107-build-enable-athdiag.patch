@@ -1,0 +1,21 @@
+--- a/Makefile
++++ b/Makefile
+@@ -116,12 +116,17 @@ tools_build:
+ 	($(foreach var,$(strip $(QCAWLAN_MAKEOPTS)),export $(var);) \
+ 		$(MAKEARCH) -C $(CURR_DIR)/halphy_tools/host/testcmd_tlv \
+ 		-f makefile.linux WLAN_TOP=$(CURR_DIR))
+-
++	($(foreach var,$(strip $(QCAWLAN_MAKEOPTS)),export $(var);) \
++	    $(MAKEARCH) -C $(CURR_DIR)/offload/os/linux/tools/athdiag \
++    	    QCACFLAGS="$(TARGET_CFLAGS)"  \
++    	    QCALDFLAGS="-Wl,--gc-sections $(TARGET_LDFLAGS)")
++ 
+ tools_installonly:
+ 	@echo "==============================INSTALLING TOOLS==================================="
+ 	$(INSTALL_BIN) $(foreach tool,$(QCAWLAN_TOOL_LIST),$(CURR_DIR)/os/linux/tools/$(tool)) $(INSTALL_BIN_DEST)
+ 	$(INSTALL_BIN) $(CURR_DIR)/halphy_tools/host/testcmd_tlv/Linux/athtestcmd $(INSTALL_BIN_DEST)
+ 	$(INSTALL_DATA) $(CURR_DIR)/halphy_tools/host/testcmd_tlv/Linux/*.so $(INSTALL_LIB_DEST)
++	$(INSTALL_BIN) $(CURR_DIR)/offload/os/linux/tools/athdiag/athdiag $(INSTALL_BIN_DEST)	
+ 
+ tools_install: tools_build tools_installonly
+ 

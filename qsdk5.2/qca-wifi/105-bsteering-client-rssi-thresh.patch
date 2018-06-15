@@ -1,0 +1,501 @@
+--- a/include/ieee80211_band_steering_api.h
++++ b/include/ieee80211_band_steering_api.h
+@@ -423,6 +423,20 @@ typedef struct ieee80211_bsteering_rssi_
+     u_int16_t num_measurements;
+ } ieee80211_bsteering_rssi_req_t;
+ 
++
++/**
++ * Parameters that can be configured by userspace on a per client
++ * basis
++ */
++typedef struct ieee80211_bsteering_cli_param_t {
++    u_int8_t  probe_rssi_hwm;
++    u_int8_t  probe_rssi_lwm;
++    u_int8_t  inact_rssi_xing;
++    u_int8_t  low_rssi_xing;
++    u_int8_t  low_rate_rssi_xing;
++    u_int8_t  high_rate_rssi_xing;
++} ieee80211_bsteering_cli_param_t;
++
+ /**
+  * Parameters that can be configured by userspace to enable logging of
+  * intermediate results via events to userspace.
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -543,6 +543,8 @@ enum {
+     IEEE80211_DBGREQ_BSTEERING_SET_PROBE_RESP_ALLOW_24G = 70, /* Control whether probe responses are allowed for a MAC in 2.4g band */
+     IEEE80211_DBGREQ_SETINNETWORK_2G              = 71, /*set 2.4G innetwork inforamtion to acs module*/
+     IEEE80211_DBGREQ_GETINNETWORK_2G              = 72, /*get 2.4G innetwork inforamtion from acs module*/
++    IEEE80211_DBGREQ_BSTEERING_SET_CLI_PARAMS     = 73, /* Set band steering per-client parameters */
++    IEEE80211_DBGREQ_BSTEERING_GET_CLI_PARAMS     = 74, /* Get band steering per-client parameters */
+ };
+ 
+ typedef struct ieee80211req_acs_r{
+@@ -798,6 +800,7 @@ struct ieee80211req_athdbg {
+         struct ieee80211_qos_map       qos_map;
+         ieee80211_bsteering_param_t    bsteering_param;
+         ieee80211_bsteering_dbg_param_t bsteering_dbg_param;
++        ieee80211_bsteering_cli_param_t bsteering_cli_param;
+         ieee80211_bsteering_rssi_req_t bsteering_rssi_req;
+         u_int8_t                       bsteering_probe_resp_wh;
+         u_int8_t                       bsteering_auth_allow;
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -8279,6 +8279,22 @@ ieee80211dbg_bsteering_get_dbg_params(co
+ }
+ 
+ static int
++ieee80211dbg_bsteering_set_cli_params(struct net_device *dev,
++                                      const struct ieee80211req_athdbg *req)
++{
++    struct ieee80211vap *vap = NETDEV_TO_VAP(dev);
++    return wlan_bsteering_set_cli_params(vap, req);
++}
++
++static int
++ieee80211dbg_bsteering_get_cli_params(const struct net_device *dev,
++                                      struct ieee80211req_athdbg *req)
++{
++    struct ieee80211vap *vap = NETDEV_TO_VAP(dev);
++    return wlan_bsteering_get_cli_params(vap, req);
++}
++
++static int
+ ieee80211dbg_bsteering_enable(struct net_device *dev,
+                               struct ieee80211req_athdbg *req)
+ {
+@@ -9257,6 +9273,18 @@ ieee80211_ioctl_dbgreq(struct net_device
+             if (EOK == retv) {
+                 retv = (copy_to_user(wri->pointer, req, sizeof(*req))) ?
+                     -EFAULT : 0;
++            }
++            break;
++
++        case IEEE80211_DBGREQ_BSTEERING_SET_CLI_PARAMS:
++            retv = ieee80211dbg_bsteering_set_cli_params(dev, req);
++            break;
++
++        case IEEE80211_DBGREQ_BSTEERING_GET_CLI_PARAMS:
++            retv = ieee80211dbg_bsteering_get_cli_params(dev, req);
++            if (EOK == retv) {
++                retv = (copy_to_user(wri->pointer, req, sizeof(*req))) ?
++                    -EFAULT : 0;
+             }
+             break;
+         case IEEE80211_DBGREQ_BSTEERING_SET_AUTH_ALLOW:
+--- a/umac/band_steering/band_steering.c
++++ b/umac/band_steering/band_steering.c
+@@ -642,16 +642,27 @@ int wlan_bsteering_enable_events(struct
+ int wlan_bsteering_set_probe_resp_wh(struct ieee80211vap *vap,
+                                      const struct ieee80211req_athdbg *req)
+ {
++    int     ret;
++
+     if (!ieee80211_bsteering_is_req_valid(vap, req)) {
+         return -EINVAL;
+     }
+ 
+     if (req->data.bsteering_probe_resp_wh) {
+-        return ieee80211_acl_set_param_and_flag(
+-                                    vap, req->dstmac,
+-                                    IEEE80211_ACL_FLAG_PROBE_RESP_WH,
+-                                    IEEE80211_ACL_PARAM_PROBE_RSSI_THRESHOLD,
+-                                    req->data.bsteering_probe_resp_wh);
++        ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_PROBE_RSSI_HWM, 0);
++        if (ret < 0) {
++            return ret;
++        }
++
++        ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_PROBE_RSSI_LWM, 0);
++        if (ret < 0) {
++            return ret;
++        }
++
++        return ieee80211_acl_set_flag(vap, req->dstmac,
++                                      IEEE80211_ACL_FLAG_PROBE_RESP_WH);
+     } else {
+         return ieee80211_acl_clr_flag(vap, req->dstmac,
+                                       IEEE80211_ACL_FLAG_PROBE_RESP_WH);
+@@ -1004,18 +1015,34 @@ bool ieee80211_bsteering_is_probe_resp_w
+                                           const u_int8_t *mac_addr,
+                                           u_int8_t probe_rssi)
+ {
+-    u_int8_t rssi_threshold;
++    u_int8_t    rssi_hwm = 0;
++    u_int8_t    rssi_lwm = 0;
++    int         ret;
+ 
+     if(!ieee80211_bsteering_is_vap_enabled(vap) ||
+        !ieee80211_bsteering_is_enabled(vap->iv_ic)) {
+         return false;
+     }
+ 
+-    if (ieee80211_acl_get_param_if_flag(vap, mac_addr,
+-                                        IEEE80211_ACL_FLAG_PROBE_RESP_WH,
+-                                        IEEE80211_ACL_PARAM_PROBE_RSSI_THRESHOLD,
+-                                        &rssi_threshold)) {
+-        if (rssi_threshold == 0 || probe_rssi > rssi_threshold) {
++    if (ieee80211_acl_flag_check(vap, mac_addr, IEEE80211_ACL_FLAG_PROBE_RESP_WH)) {
++        ret = ieee80211_acl_get_param(vap, mac_addr,
++                                      IEEE80211_ACL_PARAM_PROBE_RSSI_HWM, &rssi_hwm);
++        if (WARN_ON_ONCE(ret < 0)) {
++            return false;
++        }
++        ret = ieee80211_acl_get_param(vap, mac_addr,
++                                      IEEE80211_ACL_PARAM_PROBE_RSSI_LWM, &rssi_lwm);
++        if (WARN_ON_ONCE(ret < 0)) {
++            return false;
++        }
++
++        if (rssi_hwm > 0 && probe_rssi > rssi_hwm) {
++            return true;
++        }
++        else if (rssi_lwm > 0 && probe_rssi < rssi_lwm) {
++            return true;
++        }
++        else if (rssi_hwm == 0 && rssi_lwm == 0) {
+             return true;
+         }
+     }
+@@ -1325,6 +1352,185 @@ bool ieee80211_bsteering_is_probe_resp_w
+     return false;
+ }
+ 
++static void
++ieee80211_bsteering_node_set_config(struct ieee80211vap *vap,
++                                    const u_int8_t *mac_addr)
++{
++    struct ieee80211_node               *ni;
++    struct ieee80211com                 *ic = vap->iv_ic;
++    int                                 ret;
++
++    ni = ieee80211_find_node(&ic->ic_sta, mac_addr);
++    if (!ni) {
++        return;
++    }
++
++    do {
++        ret = ieee80211_acl_get_param(vap, mac_addr,
++                                      IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
++                                      &ni->ni_bs_inact_rssi_xing);
++        if (ret < 0) {
++            break;
++        }
++
++        ret = ieee80211_acl_get_param(vap, mac_addr,
++                                      IEEE80211_ACL_PARAM_BS_LOW_RSSI_XING,
++                                      &ni->ni_bs_low_rssi_xing);
++        if (ret < 0) {
++            break;
++        }
++
++        ret = ieee80211_acl_get_param(vap, mac_addr,
++                                      IEEE80211_ACL_PARAM_BS_LOW_RATE_RSSI_XING,
++                                      &ni->ni_bs_low_rate_rssi_xing);
++        if (ret < 0) {
++            break;
++        }
++
++        ret = ieee80211_acl_get_param(vap, mac_addr,
++                                      IEEE80211_ACL_PARAM_BS_HIGH_RATE_RSSI_XING,
++                                      &ni->ni_bs_high_rate_rssi_xing);
++        if (ret < 0) {
++            break;
++        }
++    } while(0);
++
++    ieee80211_free_node(ni);
++    return;
++}
++
++int
++wlan_bsteering_set_cli_params(struct ieee80211vap *vap,
++                              const struct ieee80211req_athdbg *req)
++{
++    int     ret;
++
++    if (!ieee80211_bsteering_is_req_valid(vap, req)) {
++        return -EINVAL;
++    }
++
++    if (req->data.bsteering_cli_param.probe_rssi_hwm ||
++        req->data.bsteering_cli_param.probe_rssi_lwm) {
++        ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                    IEEE80211_ACL_PARAM_PROBE_RSSI_HWM,
++                                    req->data.bsteering_cli_param.probe_rssi_hwm);
++        if (ret < 0) {
++            return ret;
++        }
++
++        ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                    IEEE80211_ACL_PARAM_PROBE_RSSI_LWM,
++                                    req->data.bsteering_cli_param.probe_rssi_lwm);
++        if (ret < 0) {
++            return ret;
++        }
++
++        ret = ieee80211_acl_set_flag(vap, req->dstmac,
++                                     IEEE80211_ACL_FLAG_PROBE_RESP_WH);
++    }
++    else {
++        ret = ieee80211_acl_clr_flag(vap, req->dstmac,
++                                     IEEE80211_ACL_FLAG_PROBE_RESP_WH);
++    }
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
++                                  req->data.bsteering_cli_param.inact_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_LOW_RSSI_XING,
++                                  req->data.bsteering_cli_param.low_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_LOW_RATE_RSSI_XING,
++                                  req->data.bsteering_cli_param.low_rate_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_HIGH_RATE_RSSI_XING,
++                                  req->data.bsteering_cli_param.high_rate_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    // Apply now if client is connected
++    ieee80211_bsteering_node_set_config(vap, req->dstmac);
++
++    return EOK;
++}
++
++int
++wlan_bsteering_get_cli_params(struct ieee80211vap *vap,
++                              struct ieee80211req_athdbg *req)
++{
++    int     ret;
++
++    if (!ieee80211_bsteering_is_req_valid(vap, req)) {
++        return -EINVAL;
++    }
++
++    if (ieee80211_acl_flag_check(vap, req->dstmac, IEEE80211_ACL_FLAG_PROBE_RESP_WH)) {
++        ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_PROBE_RSSI_HWM,
++                                      &req->data.bsteering_cli_param.probe_rssi_hwm);
++        if (ret < 0) {
++            return ret;
++        }
++
++        ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_PROBE_RSSI_LWM,
++                                      &req->data.bsteering_cli_param.probe_rssi_lwm);
++        if (ret < 0) {
++            return ret;
++        }
++    }
++    else {
++        req->data.bsteering_cli_param.probe_rssi_hwm = 0;
++        req->data.bsteering_cli_param.probe_rssi_lwm = 0;
++    }
++
++    ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
++                                  &req->data.bsteering_cli_param.inact_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_LOW_RSSI_XING,
++                                  &req->data.bsteering_cli_param.low_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_LOW_RATE_RSSI_XING,
++                                  &req->data.bsteering_cli_param.low_rate_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                  IEEE80211_ACL_PARAM_BS_HIGH_RATE_RSSI_XING,
++                                  &req->data.bsteering_cli_param.high_rate_rssi_xing);
++    if (ret < 0) {
++        return ret;
++    }
++
++    return EOK;
++}
++
+ /**
+  * @brief Initialize the band steering infrastructure.
+  *
+@@ -1546,6 +1752,9 @@ void ieee80211_bsteering_send_node_assoc
+         return;
+     }
+ 
++    // Apply per-client config
++    ieee80211_bsteering_node_set_config(vap, ni->ni_macaddr);
++
+     OS_MEMCPY(assoc.client_addr, ni->ni_macaddr, IEEE80211_ADDR_LEN);
+     assoc.isBTMSupported = (bool)(ni->ni_ext_capabilities & IEEE80211_EXTCAPIE_BSSTRANSITION);
+     assoc.isRRMSupported = (bool)(ni->ni_flags & IEEE80211_NODE_RRM);
+@@ -2292,12 +2501,12 @@ static BSTEERING_XING_DIRECTION ieee8021
+ void ieee80211_bsteering_record_rssi(struct ieee80211_node *ni, u_int8_t rssi)
+ {
+     ieee80211_bsteering_t bsteering = NULL;
++    u_int32_t inact_rssi_high_threshold, inact_rssi_low_threshold, low_rssi_threshold;
++    u_int32_t low_rate_rssi_threshold, high_rate_rssi_threshold;
+     BSTEERING_XING_DIRECTION inact_xing = BSTEERING_XING_UNCHANGED;
+     BSTEERING_XING_DIRECTION low_xing = BSTEERING_XING_UNCHANGED;
+     BSTEERING_XING_DIRECTION rate_xing = BSTEERING_XING_UNCHANGED;
+     BSTEERING_XING_DIRECTION ap_xing = BSTEERING_XING_UNCHANGED;
+-    u_int32_t low_rate_rssi_threshold = 0;
+-    u_int32_t high_rate_rssi_threshold = 0;
+ 
+     if (!ni || !ieee80211_bsteering_is_vap_enabled(ni->ni_vap) ||
+         !ieee80211_bsteering_is_valid(ni->ni_vap->iv_ic)) {
+@@ -2318,11 +2527,34 @@ void ieee80211_bsteering_record_rssi(str
+                                                             rssi, true /* is_debug */);
+         }
+ 
+-        low_rate_rssi_threshold =
+-            bsteering->bs_config_params.low_rate_rssi_crossing_threshold;
++        if (ni->ni_bs_inact_rssi_xing) {
++            inact_rssi_low_threshold  = ni->ni_bs_inact_rssi_xing;
++            inact_rssi_high_threshold = ni->ni_bs_inact_rssi_xing;
++        }
++        else {
++            inact_rssi_low_threshold  = bsteering->bs_config_params.inactive_rssi_xing_low_threshold;
++            inact_rssi_high_threshold = bsteering->bs_config_params.inactive_rssi_xing_high_threshold;
++        }
++
++        if (ni->ni_bs_low_rssi_xing) {
++            low_rssi_threshold = ni->ni_bs_low_rssi_xing;
++        }
++        else {
++            low_rssi_threshold = bsteering->bs_config_params.low_rssi_crossing_threshold;
++        }
+ 
+-        high_rate_rssi_threshold =
+-            bsteering->bs_config_params.high_rate_rssi_crossing_threshold;
++        if (ni->ni_bs_low_rate_rssi_xing) {
++            low_rate_rssi_threshold = ni->ni_bs_low_rate_rssi_xing;
++        }
++        else {
++            low_rate_rssi_threshold = bsteering->bs_config_params.low_rate_rssi_crossing_threshold;
++        }
++        if (ni->ni_bs_high_rate_rssi_xing) {
++            high_rate_rssi_threshold = ni->ni_bs_high_rate_rssi_xing;
++        }
++        else {
++            high_rate_rssi_threshold = bsteering->bs_config_params.high_rate_rssi_crossing_threshold;
++        }
+ 
+         if (!ni->ni_bs_rssi) {
+             /* First RSSI measurement */
+@@ -2340,18 +2572,20 @@ void ieee80211_bsteering_record_rssi(str
+             /* Check inactivity rssi threshold crossing */
+             inact_xing = ieee80211_bsteering_check_rssi_cross_threshold(
+                              ni, rssi,
+-                             bsteering->bs_config_params.inactive_rssi_xing_low_threshold,
+-                             bsteering->bs_config_params.inactive_rssi_xing_high_threshold);
++                             inact_rssi_low_threshold,
++                             inact_rssi_high_threshold);
+         } else {
+             /* Check rate rssi thresold crossing */
+             rate_xing = ieee80211_bsteering_check_rssi_cross_threshold(
+-                            ni, rssi, low_rate_rssi_threshold,
++                            ni, rssi,
++                            low_rate_rssi_threshold,
+                             high_rate_rssi_threshold);
+         }
+ 
+         /* Check low rssi thresold crossing */
+         low_xing = ieee80211_bsteering_check_rssi_cross_threshold(
+-                       ni, rssi, bsteering->bs_config_params.low_rssi_crossing_threshold,
++                       ni, rssi,
++                       low_rssi_threshold,
+                        BSTEER_INVALID_RSSI_HIGH_THRESHOLD);
+ 
+         /* Check AP rssi threshold crossing */
+--- a/umac/include/ieee80211_acl.h
++++ b/umac/include/ieee80211_acl.h
+@@ -52,7 +52,12 @@ ieee80211_acl_clr_flag(wlan_if_t vap, co
+  *        potentially others in the future) on individual ACL entries.
+  */
+ enum ieee80211_acl_param {
+-    IEEE80211_ACL_PARAM_PROBE_RSSI_THRESHOLD = 0,
++    IEEE80211_ACL_PARAM_PROBE_RSSI_HWM = 0,
++    IEEE80211_ACL_PARAM_PROBE_RSSI_LWM,
++    IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
++    IEEE80211_ACL_PARAM_BS_LOW_RSSI_XING,
++    IEEE80211_ACL_PARAM_BS_LOW_RATE_RSSI_XING,
++    IEEE80211_ACL_PARAM_BS_HIGH_RATE_RSSI_XING,
+     IEEE80211_ACL_PARAM_MAX
+ };
+ 
+--- a/umac/include/ieee80211_band_steering.h
++++ b/umac/include/ieee80211_band_steering.h
+@@ -92,6 +92,12 @@ int wlan_bsteering_set_dbg_params(struct
+ int wlan_bsteering_get_dbg_params(const struct ieee80211vap *vap,
+                                   struct ieee80211req_athdbg *req);
+ 
++int wlan_bsteering_set_cli_params(struct ieee80211vap *vap,
++                                  const struct ieee80211req_athdbg *req);
++
++int wlan_bsteering_get_cli_params(struct ieee80211vap *vap,
++                                  struct ieee80211req_athdbg *req);
++
+ /**
+  * @brief Generate an event indicating that a probe request was received.
+  *
+@@ -628,6 +634,18 @@ static inline int wlan_bsteering_get_dbg
+                                                 struct ieee80211req_athdbg *req)
+ {
+     return -EINVAL;
++}
++
++static inline int wlan_bsteering_set_cli_params(struct ieee80211vap *vap,
++                                                const struct ieee80211req_athdbg *req)
++{
++    return -EINVAL;
++}
++
++static inline int wlan_bsteering_get_cli_params(const struct ieee80211vap *vap,
++                                                struct ieee80211req_athdbg *req)
++{
++    return -EINVAL;
+ }
+ 
+ static inline int wlan_bsteering_set_overload(struct ieee80211vap *vap,
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -330,6 +330,11 @@ typedef struct ieee80211_node {
+ 
+     u_int8_t                ni_bs_rssi;    /* recv ssi used in bsteering */
+ 
++    u_int8_t                ni_bs_inact_rssi_xing;
++    u_int8_t                ni_bs_low_rssi_xing;
++    u_int8_t                ni_bs_low_rate_rssi_xing;
++    u_int8_t                ni_bs_high_rate_rssi_xing;
++
+     u_int8_t                ni_max_txpower; /* maximum TX power the STA supports */
+ 
+     /* Band steering related flags */

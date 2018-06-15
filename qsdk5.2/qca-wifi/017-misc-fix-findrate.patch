@@ -1,0 +1,31 @@
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -6279,7 +6279,7 @@ u_int8_t ath_rate_findrix_aponly(const H
+  * Get transmit rate index using rate in Kbps
+  */
+ static inline int
+-ath_tx_findindex_aponly(const HAL_RATE_TABLE *rt, int rate)
++ath_tx_findindex_aponly(struct ath_softc *sc, const HAL_RATE_TABLE *rt, int rate)
+ {
+     int i;
+     int ndx = 0;
+@@ -6287,6 +6287,10 @@ ath_tx_findindex_aponly(const HAL_RATE_T
+     for (i = 0; i < rt->rateCount; i++) {
+         if (rt->info[i].rateKbps == rate) {
+             ndx = i;
++            if (sc->sc_tx_chainmask != 1 && rt->info[i].rate_code >= 0x80 && rt->info[i].rate_code <= 0x87) {
++                // try to find rate in 2nss
++                continue;
++            }
+             break;
+         }
+     }
+@@ -6990,7 +6994,7 @@ __ath_tx_prepare_aponly(struct ath_softc
+ 
+     if (likely(txctl->isdata)) {
+         if (unlikely(txctl->ismcast)) {
+-            rcs[0].rix = (u_int8_t)ath_tx_findindex_aponly(rt, txctl->mcast_rate);
++            rcs[0].rix = (u_int8_t)ath_tx_findindex_aponly(sc, rt, txctl->mcast_rate);
+ 
+             /*
+              * mcast packets are not re-tried.

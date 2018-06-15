@@ -1,0 +1,450 @@
+--- a/hal/ah.h
++++ b/hal/ah.h
+@@ -2631,6 +2631,7 @@ struct ath_hal {
+ #endif
+     int       __ahdecl(*ah_get_therm)(struct ath_hal *ah);
+     u_int     __ahdecl(*ah_mac_to_clks)(struct ath_hal *ah, u_int usec);
++    unsigned long __ahdecl(*ah_poll_q_util)(struct ath_hal *ah);
+ #ifdef ATH_SUPPORT_DFS
+     u_int32_t   ah_use_cac_prssi;  /* we may use different PRSSI value during CAC */
+ #endif
+--- a/hal/ar9300/ar9300.h
++++ b/hal/ar9300/ar9300.h
+@@ -1627,6 +1627,7 @@ extern void ar9300_set_immunity(struct a
+ extern void ar9300_get_hw_hangs(struct ath_hal *ah, hal_hw_hangs_t *hangs);
+ 
+ extern u_int ar9300_mac_to_clks(struct ath_hal *ah, u_int clks);
++extern unsigned long ar9300_poll_q_util(struct ath_hal *ah);
+ 
+ /* tx_bf interface */
+ #ifdef ATH_SUPPORT_TxBF
+--- a/hal/ar9300/ar9300_attach.c
++++ b/hal/ar9300/ar9300_attach.c
+@@ -582,6 +582,7 @@ static const struct ath_hal_private ar93
+ #endif
+         .ah_get_therm = ar9300_get_therm,
+         .ah_mac_to_clks = ar9300_mac_to_clks,
++        .ah_poll_q_util = ar9300_poll_q_util,
+     },
+ 
+     ar9300_get_channel_edges,              /* ah_get_channel_edges */
+--- a/hal/ar9300/ar9300_misc.c
++++ b/hal/ar9300/ar9300_misc.c
+@@ -77,6 +77,26 @@ ar9300_mac_to_clks(struct ath_hal *ah, u
+     }
+ }
+ 
++unsigned long
++ar9300_poll_q_util(struct ath_hal *ah)
++{
++    unsigned long mask = 0;
++    unsigned long val;
++    int i;
++
++    for (i = 0; i < 10; i++) {
++        val = OS_REG_READ(ah, AR_QSTS(i));
++        if (val == 0xffffffff || val == 0xdeadbeef)
++            return 0;
++
++        if (val & AR_Q_STS_PEND_FR_CNT)
++            mask |= BIT(i);
++    }
++
++    mask |= BIT(31);
++    return mask;
++}
++
+ void
+ ar9300_get_mac_address(struct ath_hal *ah, u_int8_t *mac)
+ {
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -3897,6 +3897,7 @@ struct ath_ops {
+     bool        (*direct_rate_check)(ath_dev_t dev,int val);
+     int         (*get_therm)(ath_dev_t dev, int *therm);
+     int         (*mac_to_clks)(ath_dev_t dev, int usec);
++    unsigned long (*poll_q_util)(ath_dev_t dev);
+ 
+ };
+ 
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -15,12 +15,18 @@ struct ps_kapi_cc {
+ 	u64 busy_ext;
+ };
+ 
++struct ps_kapi_q_util {
++	u64 q[PS_MAX_Q_UTIL];
++	u64 cnt;
++};
++
+ struct ps_kapi_ctx {
+ 	struct ps_uapi_ioctl req;
+ 	struct ps_kapi_cc cc_sum;
+ 	struct ps_kapi_cc cc_old;
+ 	struct ps_kapi_cc cc_ref;
+ 	struct ps_kapi_survey survey;
++	struct ps_kapi_q_util q_util;
+ 	struct ieee80211_channel *prev_chan;
+ 	spinlock_t lock;
+ 	u64 rx_duration_bss;
+--- a/lmac/ath_dev/ath_internal.h
++++ b/lmac/ath_dev/ath_internal.h
+@@ -4213,6 +4213,8 @@ extern int16_t ath_hal_getChanNoise(stru
+     ((*(_ah)->ah_get_therm)((_ah)))
+ #define ath_hal_mac_to_clks(_ah, _arg) \
+     ((*(_ah)->ah_mac_to_clks)((_ah), (_arg)))
++#define ath_hal_poll_q_util(_ah) \
++    ((*(_ah)->ah_poll_q_util)((_ah)))
+ 
+ #if ATH_BT_COEX_3WIRE_MODE
+ #define ath_hal_enable_basic_3wire_btcoex(_ah) \
+--- a/lmac/ath_dev/ath_main.c
++++ b/lmac/ath_dev/ath_main.c
+@@ -6984,6 +6984,31 @@ ath_mac_to_clks(ath_dev_t dev, int usecs
+     return ath_hal_mac_to_clks(sc->sc_ah, usecs);
+ }
+ 
++static unsigned long
++ath_poll_q_util(ath_dev_t dev)
++{
++    struct ath_softc *sc = ATH_DEV_TO_SC(dev);
++    unsigned long mask;
++
++    /* The driver hangs on boot if you try to
++     * PS_WAKEUP it up before some things are in
++     * place. I took code from ath_sc_chan_busy()
++     * since it's also a timer and access similar
++     * register class.
++     */
++    if (sc->sc_nvaps == 0 ||
++        sc->sc_invalid ||
++        sc->sc_scanning ||
++        atomic_read(&sc->sc_in_reset))
++      return 0;
++
++    ATH_PS_WAKEUP(sc);
++    mask = ath_hal_poll_q_util(sc->sc_ah);
++    ATH_PS_SLEEP(sc);
++
++    return mask;
++}
++
+ /*
+  * Callback table for Atheros ARXXXX MACs
+  */
+@@ -7506,6 +7531,7 @@ static const struct ath_ops ath_ar_ops =
+     ath_rate_check,                   /*direct_rate_check*/
+     .get_therm = ath_get_therm,
+     .mac_to_clks = ath_mac_to_clks,
++    .poll_q_util = ath_poll_q_util,
+ };
+ 
+ int init_sc_params(struct ath_softc *sc,struct ath_hal *ah)
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -371,6 +371,29 @@ skip:
+ }
+ 
+ 
++static int ps_kapi_ioctl_get_q_util(struct net_device *dev,
++				    struct iw_request_info *info,
++				    union iwreq_data *wrqu,
++				    char *extra,
++				    struct ps_uapi_ioctl *cmd)
++{
++	struct ieee80211com *ic;
++	struct ps_kapi_ctx *ctx;
++
++	ic = ath_netdev_priv(dev);
++	ctx = &ic->ps_kapi_ctx;
++
++	BUILD_BUG_ON(ARRAY_SIZE(cmd->u.q_util.get.q) !=
++		     ARRAY_SIZE(ctx->q_util.q));
++
++	cmd->u.q_util.get.cnt = ctx->q_util.cnt;
++	memcpy(cmd->u.q_util.get.q,
++	       ctx->q_util.q,
++	       sizeof(cmd->u.q_util.get.q));
++
++	return 0;
++}
++
+ typedef int (*ps_kapi_ioctl_op)(struct net_device *dev,
+ 				struct iw_request_info *info,
+ 				union iwreq_data *wrqu,
+@@ -380,6 +403,7 @@ typedef int (*ps_kapi_ioctl_op)(struct n
+ static const ps_kapi_ioctl_op get_ops[PS_UAPI_IOCTL_CMD_MAX] = {
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_CHAN] = ps_kapi_ioctl_get_survey_chan,
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_BSS] = ps_kapi_ioctl_get_survey_bss,
++	[PS_UAPI_IOCTL_CMD_Q_UTIL] = ps_kapi_ioctl_get_q_util,
+ };
+ 
+ int ps_kapi_ioctl(struct net_device *dev,
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -6955,6 +6955,105 @@ ol_ath_net80211_get_therm(struct ieee802
+     return 0;
+ }
+ 
++static unsigned long __ol_poll_q_util_ar900b(struct ieee80211com *ic)
++{
++    struct ol_ath_softc_net80211 *scn = OL_ATH_SOFTC_NET80211(ic);
++    unsigned long mask = 0;
++    uint32_t headaddr;
++    uint32_t tailaddr;
++    uint32_t head;
++    uint32_t tail;
++    int err;
++    int i;
++
++    if (scn->vdev_count == 0)
++        return 0;
++
++    for (i = 0; i < 12; i++) {
++        tailaddr = 0x3f400 + 0x26c + (i * 4);
++        headaddr = 0x3f400 + 0x22c + (i * 4);
++        head = 0xffffffff;
++        tail = 0xffffffff;
++
++        err = hif_diag_read_access(scn->hif_hdl, headaddr, &head);
++        if (err != A_OK)
++            return 0;
++
++        err = hif_diag_read_access(scn->hif_hdl, tailaddr, &tail);
++        if (err != A_OK)
++            return 0;
++
++        if (head == 0xffffffff || head == 0xdeadbeef)
++            return 0;
++
++        if (tail == 0xffffffff || tail == 0xdeadbeef)
++            return 0;
++
++        if (head != tail)
++            mask |= BIT(i);
++    }
++
++    mask |= BIT(31);
++    return mask;
++}
++
++static unsigned long __ol_poll_q_util_ar900p(struct ieee80211com *ic)
++{
++    struct ol_ath_softc_net80211 *scn = OL_ATH_SOFTC_NET80211(ic);
++    unsigned long mask = 0;
++    uint32_t addr;
++    uint32_t val;
++    int err;
++    int i;
++
++    if (scn->vdev_count == 0)
++        return 0;
++
++    for (i = 0; i < 10; i++) {
++        /* MAC_QCU_CNT_0_ADDRESS */
++        addr = WLAN_MAC_BASE_ADDRESS + 0x0a00 + (i * 4);
++        val = 0xffffffff;
++
++        err = hif_diag_read_access(scn->hif_hdl, addr, &val);
++        if (err != A_OK)
++            return 0;
++
++        if (val == 0xffffffff || val == 0xdeadbeef)
++            return 0;
++
++        if (val & 0x3)
++            mask |= BIT(i);
++    }
++
++    mask |= BIT(31);
++    return mask;
++}
++
++static unsigned long ol_poll_q_util(struct ieee80211com *ic)
++{
++    struct ol_ath_softc_net80211 *scn = OL_ATH_SOFTC_NET80211(ic);
++    unsigned long mask;
++
++    qdf_spin_lock(&scn->scn_lock);
++    switch (scn->target_type) {
++    case TARGET_TYPE_AR900B:
++    case TARGET_TYPE_QCA9984:
++    case TARGET_TYPE_QCA9888:
++    case TARGET_TYPE_IPQ4019:
++        mask = __ol_poll_q_util_ar900b(ic);
++        break;
++    case TARGET_TYPE_AR9888:
++        mask = __ol_poll_q_util_ar900p(ic);
++        break;
++    default:
++        mask = 0;
++        break;
++    }
++    qdf_spin_unlock(&scn->scn_lock);
++
++    return mask;
++}
++
+ int
+ ol_ath_dev_attach(struct ol_ath_softc_net80211 *scn,
+                    IEEE80211_REG_PARAMETERS *ieee80211_conf_parm)
+@@ -7042,6 +7141,7 @@ ol_ath_dev_attach(struct ol_ath_softc_ne
+     ic->ic_whal_ratecode_to_kbps = whal_ratecode_to_kbps;
+     /* Attach the offload specific print scan function */
+     ic->ic_print_scan_config = ol_print_scan_config;
++    ic->ic_poll_q_util = ol_poll_q_util;
+     /* Attach resmgr module */
+     ol_ath_resmgr_attach(ic);
+ 
+--- a/umac/base/ieee80211_common.c
++++ b/umac/base/ieee80211_common.c
+@@ -1367,6 +1367,31 @@ static OS_TIMER_FUNC(ieee80211_noise_sta
+     }
+ }
+ 
++static OS_TIMER_FUNC(ieee80211_poll_q_util)
++{
++    struct ieee80211com *ic;
++    unsigned long mask = 0;
++    int i;
++
++    OS_GET_TIMER_ARG(ic, struct ieee80211com *);
++    OS_SET_TIMER(&ic->ic_poll_q_util_timer,
++                 msecs_to_jiffies(ic->ic_poll_q_util_interval_ms));
++
++    mask = ic->ic_poll_q_util(ic);
++
++    /* This can happen if the device is asleep or
++     * is unresponsive for whatever reason.
++     */
++    if (!(mask & BIT(31)))
++        return;
++
++    for (i = 0; i < 10; i++)
++        if (mask & BIT(i))
++            ic->ps_kapi_ctx.q_util.q[i]++;
++
++    ic->ps_kapi_ctx.q_util.cnt++;
++}
++
+ int
+ ieee80211_ifattach(struct ieee80211com *ic, IEEE80211_REG_PARAMETERS *ieee80211_reg_parm)
+ {
+@@ -1647,6 +1672,17 @@ ieee80211_ifattach(struct ieee80211com *
+     ic->ic_wb_subelem = 1;
+     ic->ic_sec_offsetie = 1;
+ 
++    ic->ic_poll_q_util_interval_ms = 1;
++    qdf_timer_init(ic->ic_osdev,
++                      &ic->ic_poll_q_util_timer,
++                      ieee80211_poll_q_util,
++                      (void *)ic,
++                      QDF_TIMER_TYPE_WAKE_APPS);
++
++    if (ic->ic_poll_q_util)
++        qdf_timer_mod(&ic->ic_poll_q_util_timer,
++                         msecs_to_jiffies(ic->ic_poll_q_util_interval_ms));
++
+     /* initialization complete */
+     ic->ic_initialized = 1;
+ 
+@@ -1680,6 +1716,7 @@ ieee80211_ifdetach(struct ieee80211com *
+     ieee80211_scan_detach_prepare(ic->ic_scanner);
+     ieee80211_resmgr_delete_prepare(ic->ic_resmgr);
+ 
++    qdf_timer_free(&ic->ic_poll_q_util_timer);
+     OS_FREE_TIMER(&ic->ic_inact_timer);
+ #if UMAC_SUPPORT_WNM
+     OS_FREE_TIMER(&ic->ic_bssload_timer);
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -9164,6 +9164,16 @@ ath_net80211_tx_flush(struct ieee80211co
+     sc->sc_ath_ops.tx_flush(sc);
+ }
+ 
++static unsigned long ath_net80211_poll_q_util(struct ieee80211com *ic)
++{
++    struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
++
++    if (scn->sc_ops->poll_q_util)
++        return scn->sc_ops->poll_q_util(scn->sc_dev);
++    else
++        return 0;
++}
++
+ int
+ ath_attach(u_int16_t devid, void *base_addr,
+            struct ath_softc_net80211 *scn,
+@@ -10228,6 +10238,7 @@ ath_detach(struct ath_softc_net80211 *sc
+ #endif
+ 
+     ic->ic_get_therm = ath_net80211_get_therm;
++    ic->ic_poll_q_util = ath_net80211_poll_q_util;
+ 
+     scn->therm_poll_interval = 0; //ms
+     OS_INIT_TIMER(scn->sc_osdev,
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -857,6 +857,7 @@ typedef struct ieee80211com {
+     ieee80211_node_lock_t         ic_nodelock;    /* on the list */
+ #endif
+     os_timer_t                    ic_inact_timer;
++    os_timer_t                    ic_poll_q_util_timer;
+ #if UMAC_SUPPORT_WNM
+     os_timer_t                    ic_bssload_timer;
+     u_int32_t                     ic_wnm_bss_count;
+@@ -1892,6 +1893,8 @@ int (*ic_print_scan_config)(wlan_if_t va
+     int                                 (*ic_get_therm)(struct ieee80211com *ic, int *signal_dbm);
+     int                                 (*ic_cc_clk_khz)(struct ieee80211com *ic);
+     struct ps_kapi_ctx                  ps_kapi_ctx;
++    int                                 ic_poll_q_util_interval_ms;
++    unsigned long                       (*ic_poll_q_util)(struct ieee80211com *ic);
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1486,6 +1486,7 @@ enum {
+     IEEE80211_PARAM_TXPOW                      = 539,   /* set/get the control frame tx power per vap */
+     IEEE80211_PARAM_THERM,
+     IEEE80211_PARAM_CSA_DEAUTH,
++    IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14359,6 +14359,10 @@ static const struct iw_priv_args ieee802
+       IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsadeauth" },
+     { IEEE80211_PARAM_CSA_DEAUTH,
+       0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsadeauth" },
++    { IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
++    IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "qutil_intval" },
++    { IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
++    0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_qutil_intval" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2092,6 +2092,9 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+             break;
+         }
+         break;
++    case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
++        ic->ic_poll_q_util_interval_ms = value;
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+@@ -4381,6 +4384,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         *value = vap->iv_csa_deauth;
+         break;
++    case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
++        *value = ic->ic_poll_q_util_interval_ms;
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         *value = vap->iv_ccmpsw_seldec;
+         break;

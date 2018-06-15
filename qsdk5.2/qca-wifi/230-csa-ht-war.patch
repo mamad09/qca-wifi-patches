@@ -1,0 +1,546 @@
+It has been observed some wireless software stacks
+don't handle CSA with operational bandwidth
+greater than HT20 well.
+
+Such devices would lose connectivity after CSA for
+a few seconds and would sometimes disassociate
+completely - depending on the traffic load.
+
+Packet captures showed tons of retransmits and
+nearly no acks from the affected devices
+suggesting possible rate control/phy config
+mismatch. This comes as no surprise considering
+CSA IE does not contain secondary chan/segment0
+information so target channel width is unknown or
+should be assumed HT20.
+
+Faking HT20 coex transitions showed promise during
+first round of testing but proved to be
+insufficient.
+
+The only reliable way to maintain links after CSA
+is to silently downgrade all associated station
+operation bandwidths to 20MHz. This prompts *our*
+rate control to limit the bandwidth used for
+transmissions. The bandwidth is upgraded only if
+given station transmits to *us* at greater
+bandwidths. This isn't ideal but there is no way
+to proactively interrogate a client to learn its
+"real" (i.e. buggy) bandwidth.
+
+A few examples include Apple Macbook's:
+
+(a)
+   The following reproduced 100% of the time.
+
+   Software:
+
+       System Software Overview:
+
+         System Version: OS X 10.11 (15A284)
+         Kernel Version: Darwin 15.0.0
+         Boot Volume: Macintosh HD
+         Boot Mode: Normal
+         Computer Name: plume’s MacBook Air
+         User Name: plume (plume)
+         Secure Virtual Memory: Enabled
+         Time since boot: 49 days 22:11
+
+   Hardware:
+
+       Hardware Overview:
+
+         Model Name: MacBook Air
+         Model Identifier: MacBookAir7,2
+         Processor Name: Intel Core i5
+         Processor Speed: 1,6 GHz
+         Number of Processors: 1
+         Total Number of Cores: 2
+         L2 Cache (per Core): 256 KB
+         L3 Cache: 3 MB
+         Memory: 4 GB
+         Boot ROM Version: MBA71.0166.B07
+         SMC Version (system): 2.27f2
+         Serial Number (system): C02QLA19G940
+         Hardware UUID: 9C4D3141-DF90-5CBC-8DCA-DDAEA3EBB012
+
+   Wi-Fi:
+
+         Software Versions:
+             CoreWLAN: 11.0 (1100.19)
+             CoreWLANKit: 11.0 (1100.19) 
+             Menu Extra: 11.0 (1101.30)  
+             System Information: 11.0 (1100.1)
+             IO80211 Family: 11.0 (1100.23)
+             Diagnostics: 5.0 (500.83)   
+             AirPort Utility: 6.3.6 (636.5)
+         Interfaces:
+           en0:
+             Card Type: AirPort Extreme  (0x14E4, 0x117)
+             Firmware Version: Broadcom BCM43xx 1.0 (7.21.94.25.1a3)
+             MAC Address: c8:69:cd:aa:9c:b0
+             Locale: ETSI
+             Country Code: US
+             Supported PHY Modes: 802.11 a/b/g/n/ac
+             Supported Channels: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
+             Wake On Wireless: Supported 
+             Status: Connected
+
+(b)
+    The following reproduced <50% of the time.
+
+    Software:
+    
+        System Software Overview:
+    
+          System Version: OS X 10.10.2 (14C109)
+          Kernel Version: Darwin 14.1.0
+          Boot Volume: Macintosh HD
+          Boot Mode: Normal
+          Computer Name: slo-func-mac-1 (2)
+          User Name: plume (plume)
+          Secure Virtual Memory: Enabled
+          Time since boot: 110 days 4:32
+    
+    Hardware:
+    
+        Hardware Overview:
+    
+          Model Name: MacBook Pro
+          Model Identifier: MacBookPro11,1
+          Processor Name: Intel Core i7
+          Processor Speed: 3 GHz
+          Number of Processors: 1
+          Total Number of Cores: 2
+          L2 Cache (per Core): 256 KB
+          L3 Cache: 4 MB
+          Memory: 16 GB
+          Boot ROM Version: MBP111.0138.B14
+          SMC Version (system): 2.16f68
+          Serial Number (system): C02NN0KLG3QT
+          Hardware UUID: 04A2C138-1516-5314-83AD-95F924B6C981
+    
+    + system_profiler SPHardwareDataType
+    + system_profiler SPAirPortDataType
+    + sed '/Current Network Information/q'
+    Wi-Fi:
+    
+          Software Versions:
+              CoreWLAN: 5.0 (500.35.2)
+              CoreWLANKit: 4.1 (410.37)
+              Menu Extra: 10.0 (1000.33.2)
+              System Information: 9.0 (900.9)
+              IO80211 Family: 7.1 (710.55)
+              Diagnostics: 4.1 (410.69)
+              AirPort Utility: 6.3.4 (634.17)
+          Interfaces:
+            en0:
+              Card Type: AirPort Extreme  (0x14E4, 0x112)
+              Firmware Version: Broadcom BCM43xx 1.0 (7.15.159.13.12)
+              MAC Address: 6c:40:08:b2:99:36
+              Locale: ETSI
+              Country Code: US
+              Supported PHY Modes: 802.11 a/b/g/n/ac
+              Supported Channels: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165
+              Wake On Wireless: Supported
+              AirDrop: Supported
+              Status: Connected
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -2924,6 +2924,10 @@ typedef struct ieee80211vap {
+     u_int8_t                   iv_csa_deauth;
+     u_int8_t                   iv_scan_filter;
+     char                       iv_scan_filter_ssid[IEEE80211_NWID_LEN+1];
++    u_int8_t                   iv_csa_interop_phy;
++    u_int8_t                   iv_csa_interop_bss;
++    u_int8_t                   iv_csa_interop_bss_active;
++    u_int8_t                   iv_csa_interop_auth;
+ } IEEE80211VAP, *PIEEE80211VAP;
+ 
+ #if QCN_IE
+--- a/umac/mlme/ieee80211_beacon.c
++++ b/umac/mlme/ieee80211_beacon.c
+@@ -692,6 +692,142 @@ ieee80211_mlme_set_beacon_suspend_state(
+     return 0;
+ }
+ 
++void
++ieee80211_csa_interop_phy_update(struct ieee80211_node *ni, int rx_bw)
++{
++    struct ieee80211vap *vap;
++    struct ieee80211com *ic;
++    int chan_bw;
++
++    if (!ni)
++        return;
++
++    vap = ni->ni_vap;
++    ic = vap->iv_ic;
++
++    switch (rx_bw) {
++        case IEEE80211_CWM_WIDTH20:
++        case IEEE80211_CWM_WIDTH40:
++        case IEEE80211_CWM_WIDTH80:
++            switch (ieee80211_get_chan_width(vap->iv_bsschan)) {
++                case 5:   chan_bw = IEEE80211_CWM_WIDTH20; break;
++                case 10:  chan_bw = IEEE80211_CWM_WIDTH20; break;
++                case 20:  chan_bw = IEEE80211_CWM_WIDTH20; break;
++                case 40:  chan_bw = IEEE80211_CWM_WIDTH40; break;
++                case 80:  chan_bw = IEEE80211_CWM_WIDTH80; break;
++                case 160: chan_bw = IEEE80211_CWM_WIDTH160; break;
++                default:  chan_bw = IEEE80211_CWM_WIDTH20; break;
++            }
++
++            if (rx_bw <= ni->ni_chwidth)
++                break;
++
++            if (rx_bw > chan_bw)
++                break;
++
++            if (unlikely(WARN_ONCE((unlikely(!(ni->ni_flags & IEEE80211_NODE_HT)) &&
++                                    unlikely(rx_bw >= IEEE80211_CWM_WIDTH40)),
++                                   "%s: [%s, %pM] ignoring %d -> %d, !ht && cw>=40",
++                                   __func__,
++                                   vap->iv_netdev_name,
++                                   ni->ni_macaddr,
++                                   ni->ni_chwidth,
++                                   rx_bw)))
++                break;
++
++            if (unlikely(WARN_ONCE((unlikely(!(ni->ni_flags & IEEE80211_NODE_VHT)) &&
++                                    unlikely(rx_bw >= IEEE80211_CWM_WIDTH80)),
++                                   "%s: [%s, %pM] ignoring %d -> %d, !vht && cw>=80",
++                                   __func__,
++                                   vap->iv_netdev_name,
++                                   ni->ni_macaddr,
++                                   ni->ni_chwidth,
++                                   rx_bw)))
++                break;
++
++            if (unlikely(WARN_ONCE((unlikely(!ni->ni_160bw_requested) &&
++                                    unlikely(rx_bw >= IEEE80211_CWM_WIDTH160)),
++                                   "%s: [%s, %pM] ignoring %d -> %d, !160assoc && cw>=160",
++                                   __func__,
++                                   vap->iv_netdev_name,
++                                   ni->ni_macaddr,
++                                   ni->ni_chwidth,
++                                   rx_bw)))
++                break;
++
++            printk("%s: [%s, %pM] upgrading CW %d -> %d (chan_bw=%d)\n",
++                   __func__,
++                   vap->iv_netdev_name,
++                   ni->ni_macaddr,
++                   ni->ni_chwidth,
++                   rx_bw,
++                   chan_bw);
++
++            ni->ni_chwidth = rx_bw;
++            ic->ic_chwidth_change(ni);
++            break;
++        case -1:
++            printk("%s: [%s, %pM] downgrading CW %d -> %d\n",
++                   __func__,
++                   vap->iv_netdev_name,
++                   ni->ni_macaddr,
++                   ni->ni_chwidth,
++                   IEEE80211_CWM_WIDTH20);
++
++            ni->ni_chwidth = IEEE80211_CWM_WIDTH20;
++            ic->ic_chwidth_change(ni);
++            break;
++        default:
++            printk("%s: [%s, %pM] unsupported CW %d -> %d, ignoring\n",
++                   __func__,
++                   vap->iv_netdev_name,
++                   ni->ni_macaddr,
++                   ni->ni_chwidth,
++                   rx_bw);
++            break;
++    }
++}
++EXPORT_SYMBOL(ieee80211_csa_interop_phy_update);
++
++static void
++ieee80211_csa_interop_phy_iter_sta(void *arg, wlan_node_t wn)
++{
++    struct ieee80211_node *bss;
++    struct ieee80211_node *ni;
++    struct ieee80211vap *vap;
++    struct ieee80211com *ic;
++
++    ni = wn;
++    bss = arg;
++    vap = ni->ni_vap;
++    ic = vap->iv_ic;
++
++    if (ni == bss) {
++        printk("%s: [%s, %pM] skipping bss node\n", __func__, vap->iv_netdev_name, ni->ni_macaddr);
++        return;
++    }
++
++    ieee80211_csa_interop_phy_update(ni, -1);
++}
++
++static void
++ieee80211_csa_interop_phy_iter_vap(void *arg, wlan_if_t wif)
++{
++    struct ieee80211vap *vap;
++
++    vap = wif;
++    if (!vap->iv_csa_interop_phy)
++        return;
++
++    wlan_iterate_station_list(vap, ieee80211_csa_interop_phy_iter_sta, vap->iv_bss);
++}
++
++static void
++ieee80211_csa_interop_phy(struct ieee80211com *ic)
++{
++    wlan_iterate_vap_list(ic, ieee80211_csa_interop_phy_iter_vap, NULL);
++}
++
+ bool
+ ieee80211_mlme_beacon_suspend_state(
+     struct ieee80211vap *vap)
+@@ -826,6 +962,26 @@ ieee80211_csa_deauth(struct ieee80211com
+     }
+ }
+ 
++static int
++ieee80211_csa_interop_bss_is_desired(struct ieee80211vap *vap)
++{
++    struct ieee80211com *ic;
++    int desired;
++
++    ic = vap->iv_ic;
++    desired = 0;
++
++    if (ic->ic_flags & IEEE80211_F_CHANSWITCH) {
++        desired = 1;
++        if (!vap->iv_csa_interop_bss)
++            desired = 0;
++    } else {
++        desired = 0;
++    }
++
++    return desired;
++}
++
+ /*
+  * Update the dynamic parts of a beacon frame based on the current state.
+  */
+@@ -862,6 +1018,7 @@ ieee80211_beacon_update(struct ieee80211
+     u_int8_t *frm = NULL;
+     struct ieee80211vap *tmp_vap = NULL;
+     int csa_ordering_cycle = 0;
++    int interop_bss_desired;
+ 
+ 	if((curr_time - prev_store_beacon_time)>=INTERVAL_STORE_BEACON * NUM_MILLISEC_PER_SEC){
+ 		update_beacon_copy = true;
+@@ -900,6 +1057,24 @@ ieee80211_beacon_update(struct ieee80211
+         htole16(ni->ni_txseqs[IEEE80211_NON_QOS_SEQ] << IEEE80211_SEQ_SEQ_SHIFT);
+     ni->ni_txseqs[IEEE80211_NON_QOS_SEQ]++;
+ 
++    interop_bss_desired = ieee80211_csa_interop_bss_is_desired(vap);
++    if (interop_bss_desired != vap->iv_csa_interop_bss_active) {
++        u_int8_t *frm;
++
++        printk("%s: csa interop bss %hhu -> %hhu\n",
++                __func__,
++                vap->iv_csa_interop_bss_active,
++                interop_bss_desired);
++
++        vap->iv_csa_interop_bss_active = interop_bss_desired;
++        frm = (u_int8_t *) wbuf_header(wbuf) + sizeof(struct ieee80211_frame);
++        frm = ieee80211_beacon_init(ni, bo, frm);
++        wbuf_set_pktlen(wbuf, (frm - (u_int8_t *)wbuf_header(wbuf)));
++
++        update_beacon_copy = true;
++        len_changed = 1;
++    }
++
+     /* If vendor ie enable configuration changed, then reinit the beacon */
+     if (vap->iv_update_vendor_ie ) {
+         qdf_print("%s reinit beacon as vndor ie confguration chnaged \n",__func__);
+@@ -993,6 +1168,7 @@ ieee80211_beacon_update(struct ieee80211
+         ic->ic_flags &= ~IEEE80211_F_CHANSWITCH;
+ 
+         ieee80211_csa_deauth(ic);
++        ieee80211_csa_interop_phy(ic);
+ 
+         if(ic->ic_chanchange_chwidth != 0){
+             /*Wide Bandwidth Channel Switch for VHT only*/
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1499,6 +1499,9 @@ enum {
+     IEEE80211_PARAM_UNIFORM_RSSI,
+     IEEE80211_PARAM_RELAX_AMSDU,
+     IEEE80211_PARAM_CSA_ORDERING,
++    IEEE80211_PARAM_CSA_INTEROP_PHY,
++    IEEE80211_PARAM_CSA_INTEROP_BSS,
++    IEEE80211_PARAM_CSA_INTEROP_AUTH,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -10071,7 +10071,6 @@ ieee80211_ioctl_sendwowpkt(struct net_de
+     return 0;
+ }
+ 
+-
+ static int
+ ieee80211_ioctl_getaclmac(struct net_device *dev, struct iw_request_info *info,
+     void *w, char *extra)
+@@ -14555,6 +14554,18 @@ static const struct iw_priv_args ieee802
+       IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsadeauth" },
+     { IEEE80211_PARAM_CSA_DEAUTH,
+       0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsadeauth" },
++    { IEEE80211_PARAM_CSA_INTEROP_PHY,
++      IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsainteropphy" },
++    { IEEE80211_PARAM_CSA_INTEROP_PHY,
++      0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsainteropphy" },
++    { IEEE80211_PARAM_CSA_INTEROP_BSS,
++      IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsainteropbss" },
++    { IEEE80211_PARAM_CSA_INTEROP_BSS,
++      0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsainteropbss" },
++    { IEEE80211_PARAM_CSA_INTEROP_AUTH,
++      IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsainteropauth" },
++    { IEEE80211_PARAM_CSA_INTEROP_AUTH,
++      0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsainteropauth" },
+     { IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
+     IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "qutil_intval" },
+     { IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
+--- a/offload/wlan/txrx/ol_rx.c
++++ b/offload/wlan/txrx/ol_rx.c
+@@ -494,6 +494,7 @@ ol_ps_kapi_inc_rx_stats(struct ieee80211
+                         int num_msdus,
+                         int msdu_chaining)
+ {
++    extern void ieee80211_csa_interop_phy_update(struct ieee80211_node *ni, int rx_bw);
+     struct ol_ath_softc_net80211 *scn;
+     struct ol_txrx_pdev_t *pdev;
+     struct htt_pdev_t *htt_pdev;
+@@ -567,6 +568,7 @@ ol_ps_kapi_inc_rx_stats(struct ieee80211
+             stats->stats[rix].num_sgi++;
+ 
+         ps_kapi_inc_rx_rssi(ic, stats, rxd, rix);
++        ieee80211_csa_interop_phy_update(ni, ri.bw);
+     }
+ 
+     if (is_retry)
+--- a/umac/txrx/ieee80211_input.c
++++ b/umac/txrx/ieee80211_input.c
+@@ -367,6 +367,7 @@ ps_kapi_inc_rx_stats(struct ieee80211_no
+                      int num_msdus,
+                      int num_bytes)
+ {
++    extern void ieee80211_csa_interop_phy_update(struct ieee80211_node *ni, int rx_bw);
+     struct ieee80211com *ic;
+     struct ps_kapi_peer_rx_stats *stats;
+     struct ps_cmn_rate_info ri = {};
+@@ -409,6 +410,8 @@ ps_kapi_inc_rx_stats(struct ieee80211_no
+         stats->num_msdus = 0;
+         stats->num_bytes = 0;
+         stats->num_retries = 0;
++
++        ieee80211_csa_interop_phy_update(ni, ri.bw);
+     }
+ 
+     if (rs->rs_isvalidrssi) {
+--- a/umac/mlme/ieee80211_ie.c
++++ b/umac/mlme/ieee80211_ie.c
+@@ -1357,6 +1357,12 @@ ieee80211_update_htinfo_cmn(struct ieee8
+             HTINFO_CCFS2_SET(vap->iv_bsschan->ic_vhtop_ch_freq_seg2, ie);
+         }
+     }
++
++    if (vap->iv_csa_interop_bss_active) {
++        ie->hi_opmode = IEEE80211_HTINFO_OPMODE_MIXED_PROT_ALL;
++        ie->hi_extchoff = IEEE80211_HTINFO_EXTOFFSET_NA;
++        ie->hi_txchwidth = IEEE80211_CWM_WIDTH20;
++    }
+ }
+ 
+ static void
+@@ -4365,6 +4371,9 @@ ieee80211_add_vhtop(u_int8_t *frm, struc
+     /* Fill in the VHT Basic MCS set */
+     vhtop->vhtop_basic_mcs_set =  htole16(ic->ic_vhtop_basic_mcs);
+ 
++    if (vap->iv_csa_interop_bss_active)
++        vhtop->vht_op_chwidth = 0;
++    
+     return frm + vhtoplen;
+ }
+ 
+--- a/umac/mlme/ieee80211_mgmt.c
++++ b/umac/mlme/ieee80211_mgmt.c
+@@ -2986,6 +2986,12 @@ ieee80211_recv_auth(struct ieee80211_nod
+         }
+     }
+ 
++    if ((vap->iv_ic->ic_flags & IEEE80211_F_CHANSWITCH) && vap->iv_csa_interop_auth) {
++        ret_val = -EBUSY;
++        ieee80211_send_auth(ni, seq + 1, IEEE80211_STATUS_REJECT_TEMP, NULL, 0, NULL);
++        goto exit;
++    }
++
+     ret_val = ieee80211_mlme_recv_auth(ni, algo, seq, status, challenge, challenge_len,wbuf,rs);
+ exit:
+     /* Note that ieee80211_ref_bss_node must have a */
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2105,6 +2105,18 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+             retv = wlan_set_param(vap, IEEE80211_RTSCTS_RATE, value);
+         }
+         break;
++    case IEEE80211_PARAM_CSA_INTEROP_PHY:
++        vap->iv_csa_interop_phy = !!value;
++        retv = 0;
++        break;
++    case IEEE80211_PARAM_CSA_INTEROP_BSS:
++        vap->iv_csa_interop_bss = !!value;
++        retv = 0;
++        break;
++    case IEEE80211_PARAM_CSA_INTEROP_AUTH:
++        vap->iv_csa_interop_auth = !!value;
++        retv = 0;
++        break;
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         switch (value) {
+         case IEEE80211_CSA_DEAUTH_NONE:
+@@ -4475,6 +4487,15 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_BCAST_RATE:
+         *value = wlan_get_param(vap, IEEE80211_BCAST_RATE);
+         break;
++    case IEEE80211_PARAM_CSA_INTEROP_PHY:
++        *value = vap->iv_csa_interop_phy;
++        break;
++    case IEEE80211_PARAM_CSA_INTEROP_BSS:
++        *value = vap->iv_csa_interop_bss;
++        break;
++    case IEEE80211_PARAM_CSA_INTEROP_AUTH:
++        *value = vap->iv_csa_interop_auth;
++        break;
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         *value = vap->iv_csa_deauth;
+         break;
+--- a/os/linux/src/osif_nss_wifiol_vdev_if.c
++++ b/os/linux/src/osif_nss_wifiol_vdev_if.c
+@@ -933,6 +933,7 @@ static void osif_nss_vdev_special_data_r
+ bool osif_nss_ni_stats_update(struct ol_ath_softc_net80211 *scn, struct sk_buff * nbuf, void *rx_mpdu_desc, uint8_t htt_rx_status, struct nss_wifi_append_statsv2_metahdr *metaheader)
+ {
+     extern void ps_kapi_inc_rx_rssi(struct ieee80211com *ic, struct ps_kapi_peer_rx_stats *stats, void *rxd, int rix);
++    extern void ieee80211_csa_interop_phy_update(struct ieee80211_node *ni, int rx_bw);
+     struct ol_txrx_vdev_t *vdev = NULL;
+     struct ieee80211vap *vap;
+     struct ieee80211com *ic;
+@@ -1001,6 +1002,7 @@ bool osif_nss_ni_stats_update(struct ol_
+             if (ri.sgi)
+                 stats->stats[rix].num_sgi++;
+             ps_kapi_inc_rx_rssi(ic, stats, rx_mpdu_desc, rix);
++            ieee80211_csa_interop_phy_update(ni, ri.bw);
+         }
+     }
+ 

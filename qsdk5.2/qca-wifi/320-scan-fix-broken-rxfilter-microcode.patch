@@ -1,0 +1,99 @@
+Some OL radio WLAN microcode revisions do not
+properly restore RxFilter HW register after
+completing a scan overriding previously set flags
+(notably WHAL_RX_FILTER_BEACON) that were set when
+AP vdevs are started.
+
+This crippled Rx of beacons on home channel. This
+caused empty on-channel scan reports in SM, could
+cause problems with OBSS co-ex and ERP protection.
+
+This is a workaround while QCA handles our report.
+Apparently Cell latest builds (2018 Feb) don't
+need this so it may be a matter of simply updating
+WLAN microcode blob.
+
+Risks:
+
+ * Data Bus Error if FW attempts to reset SoC in
+   certain ways. Unlikely.
+
+ * RxFilter corruption if FW attempts to
+   re-program the HW register in unexpected ways
+   while host overrides it. Unlikely
+--- a/offload/os/linux/ol_ath_linux.c
++++ b/offload/os/linux/ol_ath_linux.c
+@@ -2169,6 +2169,44 @@ struct net_device *ol_create_radio_netde
+     return dev;
+ }
+ 
++static void ol_ath_patch_scan_rxfilter(struct ol_ath_softc_net80211 *scn)
++{
++    const u32 addr = 0x32000 + 0x28;
++    const u32 mask = 0x10;
++    struct hif_opaque_softc *hif;
++    u32 reg;
++    int err;
++
++    hif = (void *)scn->hif_hdl;
++
++    switch (scn->target_type) {
++        case TARGET_TYPE_AR900B:
++        case TARGET_TYPE_IPQ4019:
++        case TARGET_TYPE_QCA9984:
++        case TARGET_TYPE_QCA9888:
++            break;
++        default:
++            return;
++    }
++
++    err = hif_diag_read_access(hif, addr, &reg);
++    if (err != QDF_STATUS_SUCCESS) {
++        printk("%s: failed to read register: %d, fw/hw crashed, soc hanged?\n",
++               __func__, err);
++        return;
++    }
++
++    if (reg & mask)
++        return;
++
++    reg |= mask;
++    err = hif_diag_write_access(hif, addr, reg);
++    if (err != QDF_STATUS_SUCCESS) {
++        printk("%s: failed to read register: %d, fw/hw crashed, soc hanged?\n",
++               __func__, err);
++        return;
++    }
++}
+ 
+ int
+ __ol_ath_attach(void *hif_hdl, struct ol_attach_t *ol_cfg, osdev_t osdev, qdf_device_t qdf_dev)
+@@ -2201,6 +2239,7 @@ __ol_ath_attach(void *hif_hdl, struct ol
+ 
+     scn->recovery_enable = 0;
+     scn->pci_reconnect = pci_reconnect_cb;
++    scn->sc_patch_scan_rxfilter = ol_ath_patch_scan_rxfilter;
+ 
+     QDF_PRINT_INFO(QDF_PRINT_IDX_SHARED, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "\n%s() Allocated scn %p\n", __func__, scn);
+ #ifdef EPPING_TEST
+--- a/offload/wlan/include/ol_if_athvar.h
++++ b/offload/wlan/include/ol_if_athvar.h
+@@ -744,6 +744,7 @@ struct ol_ath_softc_net80211 {
+    wdi_event_subscribe      ps_event_sub;
+    bool                     ps_txstat_discard;
+    u_int32_t                ps_txstat_ppdu_end[32];
++   void                     (*sc_patch_scan_rxfilter)(struct ol_ath_softc_net80211 *scn);
+ };
+ #define OL_ATH_DCS_ENABLE(__arg1, val) ((__arg1) |= (val))
+ #define OL_ATH_DCS_DISABLE(__arg1, val) ((__arg1) &= ~(val))
+--- a/offload/wlan/umac_offload_if/ol_if_scan.c
++++ b/offload/wlan/umac_offload_if/ol_if_scan.c
+@@ -1299,6 +1299,8 @@ ol_scan_process_event(ol_scn_t scn, wmi_
+         ss->ss_common.ss_info.si_scan_in_progress = FALSE;
+         ss->ss_scan_id  = 0;
+         spin_unlock(&ss->ss_lock);
++        if (scn->sc_patch_scan_rxfilter)
++            scn->sc_patch_scan_rxfilter(scn);
+ 
+         break;
+     case WMI_HOST_SCAN_EVENT_BSS_CHANNEL:

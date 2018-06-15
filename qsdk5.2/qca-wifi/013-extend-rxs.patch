@@ -1,0 +1,253 @@
+fix and extend rxstatus structures (in various abstraction layers)
+this is a prerequisite for rx stats
+
+--- a/hal/ah_desc.h
++++ b/hal/ah_desc.h
+@@ -194,9 +194,11 @@ struct ath_rx_status {
+ 
+     u_int8_t    rs_isaggr;      /* is part of the aggregate */
+     u_int8_t    rs_moreaggr;    /* more frames in aggr to follow */
++    u_int8_t    rs_firstaggr;
+     u_int8_t    rs_isapsd;      /* is apsd trigger frame */
+     u_int8_t    rs_num_delims;  /* number of delims in aggr */
+     u_int8_t    rs_flags;       /* misc flags */
++    u_int8_t    rs_stbc;
+     u_int32_t   evm0;
+     u_int32_t   evm1;           /* evm bytes */
+     u_int32_t   evm2;
+--- a/hal/ar9300/ar9300_recv_ds.c
++++ b/hal/ar9300/ar9300_recv_ds.c
+@@ -95,6 +95,8 @@ ar9300_proc_rx_desc_fast(struct ath_hal
+ 
+     rxs->rs_isaggr = (rxsp->status11 & AR_rx_aggr) ? 1 : 0;
+     rxs->rs_moreaggr = (rxsp->status11 & AR_rx_more_aggr) ? 1 : 0;
++    rxs->rs_firstaggr = (rxsp->status11 & AR_rx_first_aggr) ? 1 : 0;
++    rxs->rs_stbc = (rxsp->status4 & AR_rx_stbc) ? 1 : 0;
+ #if UNIFIED_SMARTANTENNA
+     rxs->rs_antenna = MS(rxsp->status4, AR_rx_antenna);
+ #else    
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -419,6 +419,8 @@ typedef struct {
+     u_int8_t        rateieee;   /* data rate received (IEEE rate code) */
+     u_int8_t        ratecode;   /* phy rate code */
+     u_int8_t        nomoreaggr; /* single frame or last of aggregation */
++    u_int8_t        firstaggr;
++    u_int8_t        stbc;
+     int             rateKbps;   /* data rate received (Kbps) */
+     int             flags;      /* status of associated wbuf */
+ #define ATH_RX_FCS_ERROR        0x01
+@@ -450,6 +452,7 @@ typedef struct {
+ #endif    
+     u_int8_t  isaggr;               /* Is this frame part of an aggregate */
+     u_int8_t  isapsd;               /* Is this frame an APSD trigger frame */
++    u_int8_t  isretry;              /* frame control says the frame was re-transmission */
+     int16_t   noisefloor;           /* Noise floor */
+     u_int16_t channel;              /* Channel */
+     uint8_t   lsig[IEEE80211_LSIG_LEN];
+--- a/include/ieee80211_defines.h
++++ b/include/ieee80211_defines.h
+@@ -206,6 +206,10 @@ typedef struct ieee80211_rx_status {
+                                    /* Higher 16 bits contains offset in the data pkt at which vow ext stats are embedded */
+ #endif
+     u_int8_t rs_isaggr;
++    u_int8_t rs_moreaggr;
++    u_int8_t rs_firstaggr;
++    u_int8_t rs_stbc;
++    u_int8_t rs_isretry;
+     u_int8_t rs_isapsd;
+     int16_t rs_noisefloor;
+     u_int16_t  rs_channel;
+@@ -230,6 +234,8 @@ typedef struct ieee80211_rx_status {
+     uint8_t     rs_servicebytes[IEEE80211_SB_LEN];
+     uint8_t     rs_fcs_error;
+     uint8_t     rs_peer_valid;
++    uint8_t     ps_ht40:1,
++                ps_sgi:1;
+ } ieee80211_recv_status;
+ 
+ #endif /* EXTERNAL_USE_ONLY */
+--- a/lmac/ath_dev/ath_edma_recv.c
++++ b/lmac/ath_dev/ath_edma_recv.c
+@@ -993,6 +993,7 @@ ath_rx_bf_handler(ath_dev_t dev,wbuf_t w
+             wbuf_init(sc->sc_rx_wbuf_waiting, (sc->sc_rxs_waiting->rs_datalen + sc->sc_rxstatuslen));
+             wbuf_pull(sc->sc_rx_wbuf_waiting, sc->sc_rxstatuslen);
+             wh = (struct ieee80211_frame *)wbuf_header(sc->sc_rx_wbuf_waiting) ;
++            rx_status.isretry = wh->i_fc[1] & IEEE80211_FC1_RETRY;
+             ath_rx_process(sc, sc->sc_bf_waiting, sc->sc_rxs_waiting, wh->i_fc[0], &rx_status, &chainreset);
+             OS_MEMZERO(&rx_status,sizeof(ieee80211_rx_status_t));
+         
+@@ -1075,6 +1076,7 @@ ath_rx_bf_handler(ath_dev_t dev,wbuf_t w
+                 wh = (struct ieee80211_frame *)wbuf_header(wbuf);  
+ 
+                 //UPLOAD the H to next level
++                rx_status.isretry = wh->i_fc[1] & IEEE80211_FC1_RETRY;
+                 ath_rx_process(sc, bf, rxs, wh->i_fc[0], &rx_status, &chainreset);
+                 //Workaround for HW issue EV [69449] Chip::Osprey HW does not filter non-directed frame for uploading TXBF delay report
+                 if(sc->last_h_invalid) {
+@@ -1650,6 +1652,7 @@ skip_wbuf_init:
+         wbuf_pull(wbuf, sc->sc_rxstatuslen);
+ 
+         wh = (struct ieee80211_frame *)wbuf_header(wbuf);
++        rx_status.isretry = wh->i_fc[1] & IEEE80211_FC1_RETRY;
+         ath_rx_process(sc, bf, rxs, wh->i_fc[0], &rx_status, &chainreset);
+ 
+         /*
+--- a/lmac/ath_dev/ath_recv.c
++++ b/lmac/ath_dev/ath_recv.c
+@@ -997,6 +997,9 @@ ath_rx_process(struct ath_softc *sc, str
+     rx_status->ratecode = rxs->rs_rate;
+     rx_status->nomoreaggr = rxs->rs_moreaggr ? 0:1;
+ 
++    rx_status->isaggr = rxs->rs_isaggr;
++    rx_status->firstaggr = rxs->rs_firstaggr;
++    rx_status->stbc = rxs->rs_stbc;
+     rx_status->isapsd = rxs->rs_isapsd;
+     rx_status->noisefloor = (sc->sc_noise_floor == 0) ?
+                    ATH_DEFAULT_NOISE_FLOOR : sc->sc_noise_floor;
+@@ -1028,19 +1031,19 @@ ath_rx_process(struct ath_softc *sc, str
+         if (rxs->rs_flags & HAL_RX_2040) {
+             rx_status->flags |= ATH_RX_40MHZ;
+             if (rxs->rs_flags & HAL_RX_GI) {
++                rx_status->flags |= ATH_RX_SHORT_GI;
+                 rx_status->rateKbps = 
+                     ATH_MULT_30_DIV_13(rx_status->rateKbps);
+             } else {
+                 rx_status->rateKbps = 
+                     ATH_MULT_27_DIV_13(rx_status->rateKbps);
+-                rx_status->flags |= ATH_RX_SHORT_GI;
+             }
+         } else {
+             if (rxs->rs_flags & HAL_RX_GI) {
++                rx_status->flags |= ATH_RX_SHORT_GI;
+                 rx_status->rateKbps = 
+                     ATH_MULT_10_DIV_9(rx_status->rateKbps);
+             } else {
+-                rx_status->flags |= ATH_RX_SHORT_GI;
+             }
+         }
+     }
+@@ -1545,6 +1548,7 @@ ath_rx_tasklet(ath_dev_t dev, int flush)
+         wh = (struct ieee80211_frame *)wbuf_raw_data(wbuf);
+         frame_fc0 = wh->i_fc[0];
+         OS_MEMZERO(&rx_status, sizeof(ieee80211_rx_status_t));
++        rx_status.isretry = wh->i_fc[1] & IEEE80211_FC1_RETRY;
+  
+ #ifndef REMOVE_PKT_LOG
+         /* do pktlog */
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -3415,6 +3415,15 @@ ath_net80211_input_aponly(ieee80211_node
+     rs.rs_isapsd = rx_status->isapsd;
+     rs.rs_noisefloor = rx_status->noisefloor;
+     rs.rs_channel = rx_status->channel;
++    rs.rs_ratephy1 = rx_status->ratecode;
++    rs.rs_moreaggr = !rx_status->nomoreaggr;
++    rs.rs_firstaggr = rx_status->firstaggr;
++    rs.rs_stbc = rx_status->stbc;
++    rs.ps_ht40 = !!(rx_status->flags & ATH_RX_40MHZ);
++    rs.ps_sgi = !!(rx_status->flags & ATH_RX_SHORT_GI);
++    rs.rs_isretry = rx_status->isretry;
++    OS_MEMCPY(rs.rs_rssictl, rx_status->rssictl, IEEE80211_MAX_ANTENNA);
++    OS_MEMCPY(rs.rs_rssiextn, rx_status->rssiextn, IEEE80211_MAX_ANTENNA);
+ 
+     /* The packet is received before changing the channel, but it
+        is indicated to UMAC after changing the channel, assign
+@@ -3652,6 +3661,15 @@ ath_ampdu_input_aponly(struct ath_softc
+     rxbuf->rx_time = OS_GET_TIMESTAMP();
+     rxbuf->rx_status.flags = rx_status->flags;
+     rxbuf->rx_status.rssi = rx_status->rssi;
++    rxbuf->rx_status.ratecode = rx_status->ratecode;
++    rxbuf->rx_status.isaggr = rx_status->isaggr;
++    rxbuf->rx_status.nomoreaggr = rx_status->nomoreaggr;
++    rxbuf->rx_status.firstaggr = rx_status->firstaggr;
++    rxbuf->rx_status.stbc = rx_status->stbc;
++    rxbuf->rx_status.isretry = wh->i_fc[1] & IEEE80211_FC1_RETRY;
++    memcpy(rxbuf->rx_status.rssictl, rx_status->rssictl, sizeof(rx_status->rssictl));
++    memcpy(rxbuf->rx_status.rssiextn, rx_status->rssiextn, sizeof(rx_status->rssiextn));
++
+     selevm = ath_hal_setrxselevm(sc->sc_ah, 0, 1);
+ 
+     if(!selevm) {
+@@ -3828,10 +3846,19 @@ ath_net80211_rx_aponly(ieee80211_handle_
+             rs.rs_rssi = rx_status->rssi;
+             rs.rs_abs_rssi = rx_status->abs_rssi;
+             rs.rs_datarate = rx_status->rateKbps;
++            rs.rs_rateieee = rx_status->rateieee;
++            rs.rs_ratephy1  = rx_status->ratecode;
+             rs.rs_isaggr = rx_status->isaggr;
+             rs.rs_isapsd = rx_status->isapsd;
++            rs.rs_firstaggr = rx_status->firstaggr;
++            rs.rs_stbc = rx_status->stbc;
+             rs.rs_noisefloor = rx_status->noisefloor;
+             rs.rs_channel = rx_status->channel;
++            rs.ps_ht40 = !!(rx_status->flags & ATH_RX_40MHZ);
++            rs.ps_sgi = !!(rx_status->flags & ATH_RX_SHORT_GI);
++            rs.rs_isretry = rx_status->isretry;
++            OS_MEMCPY(rs.rs_rssictl, rx_status->rssictl, IEEE80211_MAX_ANTENNA);
++            OS_MEMCPY(rs.rs_rssiextn, rx_status->rssiextn, IEEE80211_MAX_ANTENNA);
+ 
+             /* The packet is received before changing the channel, but it
+                is indicated to UMAC after changing the channel, assign
+@@ -4511,8 +4538,10 @@ ath_rx_process_aponly(struct ath_softc *
+     rx_status->rateieee = sc->sc_hwmap[rxs->rs_rate].ieeerate;
+     rx_status->rateKbps = sc->sc_hwmap[rxs->rs_rate].rateKbps;
+     rx_status->ratecode = rxs->rs_rate;
++    rx_status->isaggr = rxs->rs_isaggr;
+     rx_status->nomoreaggr = rxs->rs_moreaggr ? 0:1;
+-
++    rx_status->firstaggr = rxs->rs_firstaggr;
++    rx_status->stbc = rxs->rs_stbc;
+     rx_status->isapsd = rxs->rs_isapsd;
+     rx_status->noisefloor = (sc->sc_noise_floor == 0) ?
+                    ATH_DEFAULT_NOISE_FLOOR : sc->sc_noise_floor;
+@@ -4544,19 +4573,19 @@ ath_rx_process_aponly(struct ath_softc *
+         if (rxs->rs_flags & HAL_RX_2040) {
+             rx_status->flags |= ATH_RX_40MHZ;
+             if (rxs->rs_flags & HAL_RX_GI) {
++                rx_status->flags |= ATH_RX_SHORT_GI;
+                 rx_status->rateKbps =
+                     ATH_MULT_30_DIV_13(rx_status->rateKbps);
+             } else {
+                 rx_status->rateKbps =
+                     ATH_MULT_27_DIV_13(rx_status->rateKbps);
+-                rx_status->flags |= ATH_RX_SHORT_GI;
+             }
+         } else {
+             if (rxs->rs_flags & HAL_RX_GI) {
++                rx_status->flags |= ATH_RX_SHORT_GI;
+                 rx_status->rateKbps =
+                     ATH_MULT_10_DIV_9(rx_status->rateKbps);
+             } else {
+-                rx_status->flags |= ATH_RX_SHORT_GI;
+             }
+         }
+     }
+@@ -5429,6 +5458,7 @@ skip_wbuf_init:
+         wbuf_pull(wbuf, sc->sc_rxstatuslen);
+ 
+         wh = (struct ieee80211_frame *)wbuf_header(wbuf);
++        rx_status.isretry = wh->i_fc[1] & IEEE80211_FC1_RETRY;
+         ath_rx_process_aponly(sc, bf, rxs, wh->i_fc[0], &rx_status, &chainreset);
+ 
+         /*
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -6697,11 +6697,17 @@ _ath_rxstat2ieee(struct ieee80211com *ic
+     rs->rs_rateieee = rx_status->rateieee;
+     rs->rs_ratephy1  = rx_status->ratecode;
+     rs->rs_isaggr = rx_status->isaggr;
++    rs->rs_firstaggr = rx_status->firstaggr;
++    rs->rs_stbc = rx_status->stbc;
++    rs->rs_moreaggr = !rx_status->nomoreaggr;
+     rs->rs_isapsd = rx_status->isapsd;
+     rs->rs_noisefloor = rx_status->noisefloor;
+     rs->rs_channel = rx_status->channel;
+     rs->rs_full_chan = ic->ic_curchan;
+     rs->rs_fcs_error = (rx_status->flags & ATH_RX_FCS_ERROR)? 1:0;
++    rs->ps_ht40 = !!(rx_status->flags & ATH_RX_40MHZ);
++    rs->ps_sgi = !!(rx_status->flags & ATH_RX_SHORT_GI);
++    rs->rs_isretry = rx_status->isretry;
+ 
+     selevm = ath_hal_setrxselevm(sc->sc_ah, 0, 1);
+ 

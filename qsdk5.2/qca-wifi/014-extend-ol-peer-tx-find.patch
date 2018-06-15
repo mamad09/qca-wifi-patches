@@ -1,0 +1,45 @@
+--- a/offload/wlan/txrx/include/ol_txrx_peer_find.h
++++ b/offload/wlan/txrx/include/ol_txrx_peer_find.h
+@@ -105,6 +105,9 @@ ol_txrx_peer_find_hash_erase(
+ struct ol_txrx_ast_entry_t *
+ ol_tx_rawsim_getastentry(struct ol_txrx_vdev_t *vdev, qdf_nbuf_t nbuf);
+ 
++struct ol_txrx_peer_t *
++ol_txrx_get_peer_by_id(struct ol_txrx_pdev_t *pdev, int peer_id);
++
+ #if TXRX_DEBUG_LEVEL > 5
+ void ol_txrx_peer_find_display(ol_txrx_pdev_handle pdev, int indent);
+ #else
+--- a/offload/wlan/txrx/ol_txrx_peer_find.c
++++ b/offload/wlan/txrx/ol_txrx_peer_find.c
+@@ -217,6 +217,30 @@ ol_txrx_peer_find_hash_find(
+     return NULL; /* failure */
+ }
+ 
++struct ol_txrx_peer_t *
++ol_txrx_get_peer_by_id(struct ol_txrx_pdev_t *pdev, int peer_id)
++{
++    struct ol_txrx_peer_t *peer = NULL;
++
++    if (peer_id == HTT_INVALID_PEER)
++        return NULL;
++
++    if (peer_id > ol_cfg_max_peer_id(pdev->ctrl_pdev))
++        return NULL;
++
++    qdf_spin_lock_bh(&pdev->peer_ref_mutex);
++
++    peer = pdev->peer_id_to_obj_map[peer_id];
++    if (!peer)
++        goto out;
++
++    qdf_atomic_inc(&peer->ref_cnt);
++
++out:
++    qdf_spin_unlock_bh(&pdev->peer_ref_mutex);
++    return peer;
++}
++
+ void
+ ol_txrx_peer_find_hash_remove(
+     struct ol_txrx_pdev_t *pdev,

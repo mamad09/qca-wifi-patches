@@ -1,0 +1,514 @@
+--- a/include/_ieee80211.h
++++ b/include/_ieee80211.h
+@@ -21,6 +21,8 @@
+ #include "ieee80211_band_steering_api.h"
+ #include "ieee80211_phytype.h"
+ 
++#include <ps_kapi_survey.h>
++
+ /* These defines should match the table from ah_internal.h */
+ typedef enum {
+ 	DFS_UNINIT_DOMAIN	= 0,	/* Uninitialized dfs domain */
+@@ -171,6 +173,7 @@ struct ieee80211_channel {
+     u_int8_t        ic_vhtop_ch_freq_seg1;         /* Channel Center frequency */
+     u_int8_t        ic_vhtop_ch_freq_seg2;         /* Channel Center frequency applicable
+                                                   * for 80+80MHz mode of operation */ 
++    struct ps_kapi_survey ic_survey;
+ };
+ 
+ #define IEE80211_MAX_20M_SUB_CH 8 /* In case of VHT160, we can have 8 20Mhz channels */
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -1,11 +1,35 @@
+ #ifndef _PS_KAPI_H
+ #define _PS_KAPI_H
+ 
++#include <ps_kapi_survey.h>
++
++struct ieee80211com;
++struct ieee80211_channel;
++struct _ieee80211_scan_event;
++
++struct ps_kapi_cc {
++	u64 total;
++	u64 tx;
++	u64 rx;
++	u64 busy;
++	u64 busy_ext;
++};
++
+ struct ps_kapi_ctx {
+ 	struct ps_uapi_ioctl req;
++	struct ps_kapi_cc cc_sum;
++	struct ps_kapi_cc cc_old;
++	struct ps_kapi_cc cc_ref;
++	struct ps_kapi_survey survey;
++	struct ieee80211_channel *prev_chan;
+ 	spinlock_t lock;
++	u64 rx_duration_bss;
++	bool cc_old_valid;
+ };
+ 
++void ps_kapi_cc_update(struct ieee80211com *ic);
++void ps_kapi_handle_scan(struct ieee80211com *ic,
++			 struct _ieee80211_scan_event *event);
+ int ps_kapi_init(struct ps_kapi_ctx *ctx);
+ int ps_kapi_ioctl(struct net_device *dev,
+ 		  struct iw_request_info *info,
+--- /dev/null
++++ b/include/ps_kapi_survey.h
+@@ -0,0 +1,12 @@
++#ifndef _PS_KAPI_SURVEY_H
++#define _PS_KAPI_SURVEY_H
++
++struct ps_kapi_survey {
++	unsigned long long total;
++	unsigned long long rx;
++	unsigned long long tx;
++	unsigned long long busy;
++	unsigned long long busy_ext;
++};
++
++#endif
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -11,6 +11,365 @@
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+ #include <ieee80211_var.h>
++#define HW_REG_ASLEEP 0xdeadbeef
++
++/*
++   There have been reports that survey reports become
++   bogus over time. The problem has not been
++   understood yet. To help verify if it has been
++   fixed in the meantime or not add a few extra
++   checks and prints. 
++ */
++//#define DEBUG_SURVEY 1
++
++#ifdef DEBUG_SURVEY
++#define HW_REG_THR 0x40000000ULL
++#define SURVEY_THR 10000000ULL
++#endif /* DEBUG_SURVEY */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,32)
++# define lockdep_assert_held(x)
++#endif
++
++static void __ps_kapi_cc_update(struct ieee80211com *ic)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	struct ps_kapi_cc cc_new;
++	struct ieee80211_mib_cycle_cnts arg = {};
++	u64 total;
++	u64 tx;
++	u64 rx;
++	u64 busy;
++	u64 busy_ext;
++	int err;
++
++	lockdep_assert_held(&ctx->lock);
++
++	err = ic->ic_rmgetcounters(ic, &arg);
++	if (err) {
++		ctx->cc_old_valid = false;
++		return;
++	}
++
++	if (arg.cycle_count == HW_REG_ASLEEP ||
++	    arg.tx_frame_count == HW_REG_ASLEEP ||
++	    arg.rx_frame_count == HW_REG_ASLEEP ||
++	    arg.rx_clear_count == HW_REG_ASLEEP) {
++		ctx->cc_old_valid = false;
++		return;
++	}
++
++	cc_new.total = arg.cycle_count;
++	cc_new.tx = arg.tx_frame_count;
++	cc_new.rx = arg.rx_frame_count;
++	cc_new.busy = arg.rx_clear_count;
++	cc_new.busy_ext = arg.rx_clear_diff_count;
++
++	if (arg.cycle_count < ctx->cc_old.total)
++		goto update;
++
++	if (!ctx->cc_old_valid)
++		goto update;
++
++	total = cc_new.total - ctx->cc_old.total;
++	tx = cc_new.tx - ctx->cc_old.tx;
++	rx = cc_new.rx - ctx->cc_old.rx;
++	busy = cc_new.busy - ctx->cc_old.busy;
++	busy_ext = cc_new.busy_ext - ctx->cc_old.busy_ext;
++
++	if (tx > total || rx > total || busy > total || busy_ext > total)
++		goto update;
++
++	if (total >> 63 || tx >> 63 || rx >> 63 || busy >> 63 || busy_ext >> 63)
++		goto update;
++
++#if DEBUG_SURVEY
++	if (total >= HW_REG_THR ||
++	    tx >= HW_REG_THR ||
++	    rx >= HW_REG_THR ||
++	    busy >= HW_REG_THR ||
++	    busy_ext >= HW_REG_THR) {
++		printk("%s: exceeded delta threshold %llu %llu %llu %llu %llu | %llu %llu %llu %llu %llu | %llu %llu %llu %llu %llu | %llu\n",
++		       __func__,
++		       cc_new.total,
++		       cc_new.tx,
++		       cc_new.rx,
++		       cc_new.busy,
++		       cc_new.busy_ext,
++		       ctx->cc_old.total,
++		       ctx->cc_old.tx,
++		       ctx->cc_old.rx,
++		       ctx->cc_old.busy,
++		       ctx->cc_old.busy_ext,
++		       total,
++		       tx,
++		       rx,
++		       busy,
++		       busy_ext,
++		       HW_REG_THR);
++	}
++#endif /* DEBUG_SURVEY */
++
++	ctx->cc_sum.total += total;
++	ctx->cc_sum.tx += tx;
++	ctx->cc_sum.rx += rx;
++	ctx->cc_sum.busy += busy;
++	ctx->cc_sum.busy_ext += busy_ext;
++
++update:
++	ctx->cc_old = cc_new;
++	ctx->cc_old_valid = true;
++}
++
++void ps_kapi_cc_update(struct ieee80211com *ic)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctx->lock, flags);
++	__ps_kapi_cc_update(ic);
++	spin_unlock_irqrestore(&ctx->lock, flags);
++}
++EXPORT_SYMBOL(ps_kapi_cc_update);
++
++static void ps_kapi_survey_update(struct ieee80211com *ic)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	struct ps_kapi_survey *survey;
++	int clk;
++	u64 total;
++	u64 rx;
++	u64 tx;
++	u64 busy;
++	u64 busy_ext;
++
++	lockdep_assert_held(&ctx->lock);
++
++	if (!ic->ic_cc_clk_khz)
++		return;
++
++	clk = ic->ic_cc_clk_khz(ic);
++	if (clk <= 0)
++		return;
++
++	clk /= 1000;
++
++	if (ctx->prev_chan)
++		survey = &ctx->prev_chan->ic_survey;
++	else
++		survey = &ctx->survey;
++
++	__ps_kapi_cc_update(ic);
++
++	total = ctx->cc_sum.total - ctx->cc_ref.total;
++	tx = ctx->cc_sum.tx - ctx->cc_ref.tx;
++	rx = ctx->cc_sum.rx - ctx->cc_ref.rx;
++	busy = ctx->cc_sum.busy - ctx->cc_ref.busy;
++	busy_ext = ctx->cc_sum.busy_ext - ctx->cc_ref.busy_ext;
++
++	do_div(total, clk);
++	do_div(tx, clk);
++	do_div(rx, clk);
++	do_div(busy, clk);
++	do_div(busy_ext, clk);
++
++#if DEBUG_SURVEY
++	if (total >= SURVEY_THR ||
++	    tx >= SURVEY_THR ||
++	    rx >= SURVEY_THR ||
++	    busy >= SURVEY_THR ||
++	    busy_ext >= SURVEY_THR) {
++		printk("%s: exceeded delta threshold %p %hu | %llu %llu %llu %llu %llu | %llu %llu %llu %llu %llu | %llu %llu %llu %llu %llu | %llu\n",
++		       __func__,
++		       ctx->prev_chan,
++		       ctx->prev_chan ? ctx->prev_chan->ic_freq : 0,
++		       ctx->cc_sum.total,
++		       ctx->cc_sum.tx,
++		       ctx->cc_sum.rx,
++		       ctx->cc_sum.busy,
++		       ctx->cc_sum.busy_ext,
++		       ctx->cc_ref.total,
++		       ctx->cc_ref.tx,
++		       ctx->cc_ref.rx,
++		       ctx->cc_ref.busy,
++		       ctx->cc_ref.busy_ext,
++		       total,
++		       tx,
++		       rx,
++		       busy,
++		       busy_ext,
++		       SURVEY_THR);
++	}
++#endif /* DEBUG_SURVEY */
++
++	survey->total += total;
++	survey->tx += tx;
++	survey->rx += rx;
++	survey->busy += busy;
++	survey->busy_ext += busy_ext;
++
++	ctx->cc_ref = ctx->cc_sum;
++}
++
++static int ps_kapi_survey_update_bss(struct ieee80211com *ic)
++{
++	struct ps_kapi_ctx *ctx;
++	struct ieee80211vap *vap;
++	struct ieee80211_scanner_common *ssc;
++
++	ctx = &ic->ps_kapi_ctx;
++	ssc = (void *)ic->ic_scanner;
++
++	if (ssc->ss_info.si_scan_in_progress)
++		return -EBUSY;
++
++	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next)
++		if (ieee80211_vap_scanning_is_set(vap))
++			return -EBUSY;
++
++	__ps_kapi_cc_update(ic);
++	ps_kapi_survey_update(ic);
++
++	return 0;
++}
++
++void ps_kapi_handle_scan(struct ieee80211com *ic,
++			 struct _ieee80211_scan_event *event)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	unsigned long flags;
++
++	spin_lock_irqsave(&ctx->lock, flags);
++
++	ps_kapi_survey_update(ic);
++
++	switch (event->type) {
++	case IEEE80211_SCAN_STARTED:
++		ctx->prev_chan = NULL;
++		break;
++	case IEEE80211_SCAN_COMPLETED:
++		ctx->prev_chan = NULL;
++		break;
++	case IEEE80211_SCAN_HOME_CHANNEL:
++		ctx->prev_chan = NULL;
++		break;
++	case IEEE80211_SCAN_FOREIGN_CHANNEL:
++		ctx->prev_chan = event->chan;
++		break;
++	case IEEE80211_SCAN_FOREIGN_CHANNEL_GET_NF:
++		ctx->prev_chan = NULL;
++		break;
++	case IEEE80211_SCAN_SET_CHANNEL:
++		ctx->prev_chan = NULL;
++		break;
++	case IEEE80211_SCAN_RADIO_MEASUREMENT_START:
++	case IEEE80211_SCAN_RADIO_MEASUREMENT_END:
++	case IEEE80211_SCAN_RESTARTED:
++	case IEEE80211_SCAN_BSSID_MATCH:
++	case IEEE80211_SCAN_DEQUEUED:
++	case IEEE80211_SCAN_PREEMPTED:
++	case IEEE80211_SCAN_EVENT_COUNT:
++		/* ignore, not important */
++		break;
++	}
++
++	spin_unlock_irqrestore(&ctx->lock, flags);
++}
++EXPORT_SYMBOL(ps_kapi_handle_scan);
++
++static int ps_kapi_ioctl_get_survey_chan(struct net_device *dev,
++					 struct iw_request_info *info,
++					 union iwreq_data *wrqu,
++					 char *extra,
++					 struct ps_uapi_ioctl *cmd)
++{
++	struct ieee80211com *ic;
++	struct ieee80211_channel *ch;
++	struct ps_kapi_ctx *ctx;
++	unsigned long flags;
++	int i;
++	int j;
++
++	ic = ath_netdev_priv(dev);
++	ctx = &ic->ps_kapi_ctx;
++	ch = NULL;
++
++	spin_lock_irqsave(&ctx->lock, flags);
++
++	for (i = 0, j = 0; i < ic->ic_nchans; i++) {
++		ch = &ic->ic_channels[i];
++		if (!(ch->ic_flags & IEEE80211_CHAN_HT20))
++			continue;
++
++		if (j >= ARRAY_SIZE(cmd->u.survey_chan.get.channels))
++			break;
++
++		cmd->u.survey_chan.get.channels[j].freq = ch->ic_freq;
++		cmd->u.survey_chan.get.channels[j].total = ch->ic_survey.total;
++		cmd->u.survey_chan.get.channels[j].tx = ch->ic_survey.tx;
++		cmd->u.survey_chan.get.channels[j].rx = ch->ic_survey.rx;
++		cmd->u.survey_chan.get.channels[j].busy = ch->ic_survey.busy;
++		/* scanning is 20mhz only; ext busy makes no sense */
++
++		j++;
++	}
++
++	spin_unlock_irqrestore(&ctx->lock, flags);
++
++	return 0;
++}
++
++static int ps_kapi_ioctl_get_survey_bss(struct net_device *dev,
++					struct iw_request_info *info,
++					union iwreq_data *wrqu,
++					char *extra,
++					struct ps_uapi_ioctl *cmd)
++{
++	struct ieee80211com *ic;
++	struct ps_kapi_ctx *ctx;
++	unsigned long flags;
++	int clk;
++	int err;
++
++	ic = ath_netdev_priv(dev);
++	ctx = &ic->ps_kapi_ctx;
++
++	if (!ic->ic_cc_clk_khz)
++		return -EOPNOTSUPP;
++
++	clk = ic->ic_cc_clk_khz(ic);
++	if (clk <= 0)
++		return -EPERM;
++
++	IEEE80211_COMM_LOCK(ic);
++	IEEE80211_STATE_LOCK(ic);
++	spin_lock_irqsave(&ctx->lock, flags);
++
++	/* rx_duration_bss is not directly coupled with cycle counters as far
++	 * as data sourcing is concerned implying one has to be careful when
++	 * doing a snapshot. Reading this in advance reduces the chance of the
++	 * survey.rx_bss ending up greater than survey.rx.
++	 */
++	cmd->u.survey_bss.get.rx_bss = ctx->rx_duration_bss;
++
++	err = ps_kapi_survey_update_bss(ic);
++	if (err)
++		goto skip;
++
++	cmd->u.survey_bss.get.total = ctx->survey.total;
++	cmd->u.survey_bss.get.tx = ctx->survey.tx;
++	cmd->u.survey_bss.get.rx = ctx->survey.rx;
++	cmd->u.survey_bss.get.busy = ctx->survey.busy;
++	cmd->u.survey_bss.get.busy_ext = ctx->survey.busy_ext;
++
++skip:
++	spin_unlock_irqrestore(&ctx->lock, flags);
++	IEEE80211_STATE_UNLOCK(ic);
++	IEEE80211_COMM_UNLOCK(ic);
++
++	return err;
++}
++
+ 
+ typedef int (*ps_kapi_ioctl_op)(struct net_device *dev,
+ 				struct iw_request_info *info,
+@@ -19,6 +378,8 @@ typedef int (*ps_kapi_ioctl_op)(struct n
+ 				struct ps_uapi_ioctl *cmd);
+ 
+ static const ps_kapi_ioctl_op get_ops[PS_UAPI_IOCTL_CMD_MAX] = {
++	[PS_UAPI_IOCTL_CMD_SURVEY_CHAN] = ps_kapi_ioctl_get_survey_chan,
++	[PS_UAPI_IOCTL_CMD_SURVEY_BSS] = ps_kapi_ioctl_get_survey_bss,
+ };
+ 
+ int ps_kapi_ioctl(struct net_device *dev,
+--- a/umac/mlme/ieee80211_proto.c
++++ b/umac/mlme/ieee80211_proto.c
+@@ -20,6 +20,10 @@
+ #endif
+ #include <if_smart_ant.h>
+ 
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ 
+ /* XXX tunables */
+ #define AGGRESSIVE_MODE_SWITCH_HYSTERESIS   3   /* pkts / 100ms */
+@@ -64,6 +68,9 @@ int ieee80211_state_event(struct ieee802
+ static void ieee80211_vap_scan_event_handler(struct ieee80211vap *originator, ieee80211_scan_event *event, void *arg)
+ {
+     struct ieee80211vap *vap = (struct ieee80211vap *) arg;
++    struct ieee80211com *ic = vap->iv_ic;
++
++    ps_kapi_handle_scan(ic, event);
+ 
+     /*
+      * Ignore notifications received due to scans requested by other modules.
+--- a/lmac/ath_dev/ath_edma_recv.c
++++ b/lmac/ath_dev/ath_edma_recv.c
+@@ -1193,6 +1193,7 @@ ath_rx_handler(ath_dev_t dev, int flush,
+ 
+     rxedma = &sc->sc_rxedma[qtype];
+     athbuf_req.rxedma = rxedma;
++    ps_kapi_cc_update(sc->sc_ieee);
+     
+     DPRINTF(sc, ATH_DEBUG_RX_PROC, "%s\n", __func__);
+     do {
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -5197,6 +5197,7 @@ ath_rx_handler_aponly(ath_dev_t dev, int
+ 
+ 
+     START_PERF_CNTR(rx_tasklet, rx_tasklet);
++    ps_kapi_cc_update(sc->sc_ieee);
+ 
+     rxedma = &sc->sc_rxedma[qtype];
+     do {
+--- a/umac/mlme/ieee80211_bssload.c
++++ b/umac/mlme/ieee80211_bssload.c
+@@ -17,6 +17,10 @@
+ #include <ieee80211_var.h>
+ #include "ieee80211_bssload.h"
+ 
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ #if UMAC_SUPPORT_BSSLOAD || UMAC_SUPPORT_CHANUTIL_MEASUREMENT
+ 
+ /*
+@@ -29,6 +33,8 @@ ieee80211_beacon_chanutil_update(struct
+     struct ieee80211com *ic = vap->iv_ic;
+     struct ieee80211_mib_cycle_cnts cnts;
+     struct ieee80211_chanutil_info *cu = &vap->chanutil_info;
++
++    ps_kapi_cc_update(ic);
+     
+     if (cu->cycle_count == 0) {
+         /* read the cycle counts and return */

@@ -1,0 +1,27 @@
+It makes little sense to allow scans while CSA is
+ongoing. It could introduce possible disruption
+to CS countdown beacons and risk of failure in
+case of CSA with small CS count and high
+interference (connected clients might never get to
+see any CSA IE containing beacons).
+
+This patch doesn't perfectly prevent scans and CSA
+colliding but is cheap enough (code wise) to not
+apply it considering it greatly reduces risk of
+failures.
+--- a/umac/scan/ieee80211_scan_api.c
++++ b/umac/scan/ieee80211_scan_api.c
+@@ -62,6 +62,13 @@ int wlan_scan_start(wlan_if_t
+                     IEEE80211_SCAN_PRIORITY  priority,
+                     IEEE80211_SCAN_ID        *scan_id)
+ {
++    struct ieee80211com *ic = vaphandle->iv_ic;
++
++    if (ic->ic_flags & IEEE80211_F_CHANSWITCH) {
++        printk("%s: refusing to start scan because CSA is in progress\n", __func__);
++        return -EAGAIN;
++    }
++
+ #if ATH_SUPPORT_DFS
+     STA_VAP_DOWNUP_LOCK(vaphandle->iv_ic);
+     if(ieee80211_dfs_is_ap_cac_timer_running(vaphandle->iv_ic)) {

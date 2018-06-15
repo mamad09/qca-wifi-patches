@@ -1,0 +1,11 @@
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -105,7 +105,7 @@
+ #if ATH_SUPPORT_AP_WDS_COMBO
+ #define IEEE80211_BINTVAL_DEFAULT    400   /* default beacon interval (TU's) for 16 vap support */
+ #else
+-#define IEEE80211_BINTVAL_DEFAULT    100   /* default beacon interval (TU's) */
++#define IEEE80211_BINTVAL_DEFAULT    200   /* default beacon interval (TU's) */
+ #endif
+ 
+ #define IEEE80211_BINTVAL_MBSSID_MIN 100

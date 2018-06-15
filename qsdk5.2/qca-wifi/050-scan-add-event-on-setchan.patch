@@ -1,0 +1,54 @@
+--- a/include/ieee80211_defines.h
++++ b/include/ieee80211_defines.h
+@@ -726,6 +726,7 @@ typedef enum _ieee80211_scan_event_type
+     IEEE80211_SCAN_FOREIGN_CHANNEL_GET_NF,
+     IEEE80211_SCAN_DEQUEUED,
+     IEEE80211_SCAN_PREEMPTED,
++    IEEE80211_SCAN_SET_CHANNEL,
+ 
+     IEEE80211_SCAN_EVENT_COUNT
+ } ieee80211_scan_event_type;
+--- a/umac/scan/ieee80211_scan.c
++++ b/umac/scan/ieee80211_scan.c
+@@ -1971,6 +1971,13 @@ static void scanner_terminate(ieee80211_
+                 if (!(ss->ss_ic->cw_inter_found))
+ #endif
+                 {
++                    scanner_post_event(ss,
++                                      ss->ss_vap,
++                                      IEEE80211_SCAN_SET_CHANNEL,
++                                      IEEE80211_REASON_NONE,
++                                      ss->ss_scan_id,
++                                      ss->ss_requestor,
++                                      ss->ss_vap->iv_bsschan);
+                     ieee80211_set_channel(ss->ss_ic, ss->ss_vap->iv_bsschan);
+                 }
+ #if ATH_VAP_PAUSE_SUPPORT
+@@ -2783,6 +2790,13 @@ static void scanner_state_foreign_channe
+ 
+     if (!ieee80211_resmgr_active(ss->ss_ic) ||
+         (ieee80211_sm_get_curstate(ss->ss_hsm_handle) == SCANNER_STATE_FOREIGN_CHANNEL)) {
++        scanner_post_event(ss,
++                          ss->ss_vap,
++                          IEEE80211_SCAN_SET_CHANNEL,
++                          IEEE80211_REASON_NONE,
++                          ss->ss_scan_id,
++                          ss->ss_requestor,
++                          ss->ss_chans[ss->ss_next]);
+         ieee80211_set_channel(ss->ss_ic, ss->ss_chans[ss->ss_next]);
+ #if ATH_SUPPORT_SPECTRAL
+         {
+@@ -3603,6 +3617,13 @@ static void scanner_state_bss_channel_en
+         (ieee80211_sm_get_curstate(ss->ss_hsm_handle) != SCANNER_STATE_SUSPENDING_TRAFFIC)) {
+         if (! ieee80211_resmgr_active(ss->ss_ic)) {
+             ss->ss_ic->ic_scan_end(ss->ss_ic);
++            scanner_post_event(ss,
++                              ss->ss_vap,
++                              IEEE80211_SCAN_SET_CHANNEL,
++                              IEEE80211_REASON_NONE,
++                              ss->ss_scan_id,
++                              ss->ss_requestor,
++                              ss->ss_vap->iv_bsschan);
+             ieee80211_set_channel (ss->ss_ic, ss->ss_vap->iv_bsschan);
+ #if ATH_SLOW_ANT_DIV
+             ss->ss_ic->ic_antenna_diversity_resume(ss->ss_ic);

@@ -1,0 +1,196 @@
+--- a/include/ieee80211_band_steering_api.h
++++ b/include/ieee80211_band_steering_api.h
+@@ -30,6 +30,23 @@ struct bs_probe_req_ind {
+     u_int8_t blocked;
+ };
+ 
++typedef enum {
++    BSTEERING_SOURCE_LOCAL = 0,
++    BSTEERING_SOURCE_REMOTE
++} BSTEERING_DISCONNECT_SOURCE;
++
++typedef enum {
++    BSTEERING_DISASSOC = 0,
++    BSTEERING_DEAUTH
++} BSTEERING_DISCONNECT_TYPE;
++
++struct bs_disconnect_ind {
++    u_int8_t client_addr[IEEE80211_ADDR_LEN];
++    BSTEERING_DISCONNECT_SOURCE source;
++    BSTEERING_DISCONNECT_TYPE type;
++    u_int32_t reason;
++};
++
+ /**
+  * Metadata about an authentication message that was sent with a failure
+  * code due to the client being prohibited by the ACL.
+@@ -331,6 +348,7 @@ typedef struct ath_netlink_bsteering_eve
+         struct bs_sta_stats_ind bs_sta_stats;
+         struct bs_node_smps_update_ind smps_update;
+         struct bs_node_opmode_update_ind opmode_update;
++        struct bs_disconnect_ind bs_disconnect_ind;
+     } data;
+ } ath_netlink_bsteering_event_t;
+ 
+@@ -506,6 +524,9 @@ typedef enum {
+     /* Indication that an authentication is allowed due to Auth Allow flag
+        set.*/
+     ATH_EVENT_BSTEERING_DBG_TX_AUTH_ALLOW = 35,
++    /* Indication when a client has been deauthenticated or
++     * disassociated */
++    ATH_EVENT_BSTEERING_CLIENT_DISCONNECTED,
+ } ATH_BSTEERING_EVENT;
+ 
+ typedef struct ieee80211_bsteering_probe_resp_wh_entry {
+--- a/os/linux/src/osif_umac.c
++++ b/os/linux/src/osif_umac.c
+@@ -42,6 +42,8 @@
+ 
+ #if ATH_BAND_STEERING
+ #include "ath_band_steering.h"
++#include "ieee80211_band_steering_api.h"
++#include "ieee80211_band_steering.h"
+ #endif
+ 
+ #include "ieee80211_ev.h"
+@@ -2387,6 +2389,8 @@ osif_assoc_indication_ap(os_handle_t osi
+     union iwreq_data wapi_wreq;
+     u_int8_t *sta_msg;
+     int msg_len;
++#elif ATH_BAND_STEERING
++    wlan_if_t vap = ((osif_dev *)osif)->os_if;
+ #endif
+ #if UMAC_SUPPORT_ACFG
+ 	acfg_event_data_t *acfg_event = NULL;
+@@ -2511,6 +2515,14 @@ static void osif_deauth_indication_ap(os
+         IEEE80211_ADDR_COPY(evmsg.addr, macaddr);
+         WIRELESS_SEND_EVENT(dev, IWEVCUSTOM, &wrqu, (char *)&evmsg);
+     }
++
++#if ATH_BAND_STEERING
++    ieee80211_bsteering_send_disconnect_event(vap, macaddr,
++                                              BSTEERING_SOURCE_REMOTE,
++                                              BSTEERING_DEAUTH,
++                                              reason);
++#endif
++
+ #if UMAC_SUPPORT_ACFG
+     kfree(acfg_event);
+ #endif
+@@ -3051,6 +3063,8 @@ static void osif_leave_indication_ap(os_
+     union iwreq_data wapi_wreq;
+     u_int8_t *sta_msg;
+     int msg_len;
++#elif ATH_BAND_STEERING
++    wlan_if_t vap = ((osif_dev *)osif)->os_if;
+ #endif
+ #if UMAC_SUPPORT_ACFG
+     acfg_event_data_t *acfg_event = NULL;
+@@ -3094,6 +3108,13 @@ static void osif_leave_indication_ap(os_
+         WIRELESS_SEND_EVENT(dev, IWEVCUSTOM, &wrqu, (char *)&evmsg);
+     }
+ 
++#if ATH_BAND_STEERING
++    ieee80211_bsteering_send_disconnect_event(vap, macaddr,
++                                              BSTEERING_SOURCE_REMOTE,
++                                              BSTEERING_DISASSOC,
++                                              reason);
++#endif
++
+ #if UMAC_SUPPORT_ACFG
+     kfree(acfg_event);
+ #endif
+--- a/umac/band_steering/band_steering.c
++++ b/umac/band_steering/band_steering.c
+@@ -147,6 +147,30 @@ static bool ieee80211_bsteering_is_req_v
+         ieee80211_bsteering_is_valid(vap->iv_ic) && NULL != req;
+ }
+ 
++void ieee80211_bsteering_send_disconnect_event(struct ieee80211vap *vap,
++                                               const u_int8_t *mac_addr,
++                                               BSTEERING_DISCONNECT_SOURCE src,
++                                               BSTEERING_DISCONNECT_TYPE type,
++                                               u_int32_t reason)
++{
++    struct bs_disconnect_ind    disc;
++
++    if(!ieee80211_bsteering_is_vap_enabled(vap) ||
++       !ieee80211_bsteering_is_enabled(vap->iv_ic)) {
++        return;
++    }
++
++    OS_MEMCPY(disc.client_addr, mac_addr, IEEE80211_ADDR_LEN);
++    disc.source = src;
++    disc.type   = type;
++    disc.reason = reason;
++
++    IEEE80211_DELIVER_BSTEERING_EVENT(vap, ATH_EVENT_BSTEERING_CLIENT_DISCONNECTED,
++                                      sizeof(disc),
++                                      (const char *) &disc);
++    return;
++}
++
+ /**
+  * @brief Set the band steering parameters from user space.
+  *
+--- a/umac/include/ieee80211_band_steering.h
++++ b/umac/include/ieee80211_band_steering.h
+@@ -98,6 +98,12 @@ int wlan_bsteering_set_cli_params(struct
+ int wlan_bsteering_get_cli_params(struct ieee80211vap *vap,
+                                   struct ieee80211req_athdbg *req);
+ 
++void ieee80211_bsteering_send_disconnect_event(struct ieee80211vap *vap,
++                                               const u_int8_t *mac_addr,
++                                               BSTEERING_DISCONNECT_SOURCE src,
++                                               BSTEERING_DISCONNECT_TYPE type,
++                                               u_int32_t reason);
++
+ /**
+  * @brief Generate an event indicating that a probe request was received.
+  *
+--- a/umac/mlme/ieee80211_mgmt.c
++++ b/umac/mlme/ieee80211_mgmt.c
+@@ -25,6 +25,10 @@
+ #include <ieee80211_target.h>
+ #endif
+ #include "dfs_ioctl.h"
++#if ATH_BAND_STEERING
++#include <ieee80211_band_steering_api.h>
++#include <ieee80211_band_steering.h>
++#endif
+ /*
+  * xmit management processing code.
+  */
+@@ -616,6 +620,15 @@ ieee80211_send_deauth(struct ieee80211_n
+         frlen = sizeof(struct ieee80211_mmie);
+     }
+ 
++#if ATH_BAND_STEERING
++    if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
++        ieee80211_bsteering_send_disconnect_event(vap, da,
++                                                  BSTEERING_SOURCE_LOCAL,
++                                                  BSTEERING_DEAUTH,
++                                                  reason);
++    }
++#endif
++
+     wbuf = wbuf_alloc(ic->ic_osdev, WBUF_TX_MGMT, (sizeof(struct ieee80211_frame)+frlen));
+     if (wbuf == NULL)
+         return -ENOMEM;
+@@ -705,6 +718,16 @@ int ieee80211_send_disassoc_with_callbac
+             frlen = sizeof(struct ieee80211_mmie);
+         }
+     }
++
++#if ATH_BAND_STEERING
++    if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
++        ieee80211_bsteering_send_disconnect_event(vap, da,
++                                                  BSTEERING_SOURCE_LOCAL,
++                                                  BSTEERING_DISASSOC,
++                                                  reason);
++    }
++#endif
++
+     wbuf = wbuf_alloc(ic->ic_osdev, WBUF_TX_MGMT, MAX_TX_RX_PACKET_SIZE);
+     if (wbuf == NULL)
+         return -ENOMEM;

@@ -1,0 +1,209 @@
+It has been found that vdev-restart command issue
+order in AP+STA scenario is of significance - at
+least on some 10.4 firmware revisions (confirmed
+on Hallasan qsdk40, qsdk50).
+
+Apparently FW will often not do WAL channel change
+if STA vap is vdev-restart requested last (i.e.
+after other AP vaps had their vdev-restart
+requests sent).
+
+The iwpriv knob is intended for debugging only.
+Userspace SW should not tweak it to fix bugs -
+instead this patch should be made changes/made
+more robust to hide this FW quirk.
+
+At first this was a problem verified only on
+qsdk40.
+
+Initially qsdk50 did not seem to have needed this
+workaround but after a few CSU updates it became a
+problem too but apparently only when STA vap
+vdev restart request is neither last nor first.
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1498,6 +1498,7 @@ enum {
+     IEEE80211_PARAM_RSSI_COMBINED_FIX,
+     IEEE80211_PARAM_UNIFORM_RSSI,
+     IEEE80211_PARAM_RELAX_AMSDU,
++    IEEE80211_PARAM_CSA_ORDERING,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14580,6 +14580,8 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_UNIFORM_RSSI, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "guniformrssi" },
+     { IEEE80211_PARAM_RELAX_AMSDU, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "srelaxamsdu" },
+     { IEEE80211_PARAM_RELAX_AMSDU, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "grelaxamsdu" },
++    { IEEE80211_PARAM_CSA_ORDERING, IW_PRIV_TYPE_CHAR | 33, 0, "csaordering" },
++    { IEEE80211_PARAM_CSA_ORDERING, 0, IW_PRIV_TYPE_CHAR | 33, "gcsaordering" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -620,6 +620,12 @@ struct ieee80211_relax_amsdu_conf {
+     int enabled;
+ };
+ 
++enum ieee80211_csa_ordering {
++	IEEE80211_CSA_ORDERING_NONE,
++	IEEE80211_CSA_ORDERING_STA_FIRST,
++	IEEE80211_CSA_ORDERING_STA_LAST,
++};
++
+ typedef struct ieee80211com {
+     osdev_t                       ic_osdev; /* OS opaque handle */
+     qdf_device_t                  ic_qdf_dev; /* ADF opaque handle */
+@@ -1908,6 +1914,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     void                                (*ic_rssi_comb_fix_set)(struct ieee80211com *ic, int enable);
+     int                                 ic_uniform_rssi;
+     struct ieee80211_relax_amsdu_conf   ic_relax_amsdu;
++    enum ieee80211_csa_ordering         ic_csa_ordering;
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -959,6 +959,12 @@ checkchan(wlan_if_t vaphandle, int chann
+ #define IEEE80211_SUBTYPE_TXPOW_SHIFT   8     /* left shift 8 bit subtype + txpower as combined value  */
+ #define IEEE80211_FRAMETYPE_TXPOW_SHIFT   16
+ 
++static const char *ieee80211_csa_ordering_map[] = {
++    [IEEE80211_CSA_ORDERING_NONE] = "none",
++    [IEEE80211_CSA_ORDERING_STA_FIRST] = "sta-first",
++    [IEEE80211_CSA_ORDERING_STA_LAST] = "sta-last",
++};
++
+ int ieee80211_ucfg_setparam(wlan_if_t vap, int param, int value, char *extra)
+ {
+     osif_dev  *osifp = (osif_dev *)wlan_vap_get_registered_handle(vap);
+@@ -2166,6 +2172,19 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+     case IEEE80211_PARAM_UNIFORM_RSSI:
+         ic->ic_uniform_rssi = value;
+         break;
++    case IEEE80211_PARAM_CSA_ORDERING:
++        {
++            int i;
++
++            retv = -EINVAL;
++            for (i = 0; i < ARRAY_SIZE(ieee80211_csa_ordering_map); i++) {
++                if (!strcmp(iwp->pointer, ieee80211_csa_ordering_map[i])) {
++                    ic->ic_csa_ordering = i;
++                    retv = 0;
++                }
++            }
++        }
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+@@ -4467,6 +4486,21 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+         memcpy(iwp->pointer, vap->iv_scan_filter_ssid, iwp->length);
+         retv = 0;
+         break;
++    case IEEE80211_PARAM_CSA_ORDERING:
++        {
++            int i;
++
++            i = ACCESS_ONCE(ic->ic_csa_ordering);
++            if (WARN_ON(i >= ARRAY_SIZE(ieee80211_csa_ordering_map))) {
++                retv = -EPERM;
++                break;
++            }
++
++            iwp->length = strlen(ieee80211_csa_ordering_map[i]);
++            strcpy(iwp->pointer, ieee80211_csa_ordering_map[i]);
++            retv = 0;
++        }
++        break;
+     case IEEE80211_PARAM_LAST_BCN_RSSI:
+     {
+         struct ieee80211_node *ni;
+--- a/umac/base/ieee80211_common.c
++++ b/umac/base/ieee80211_common.c
+@@ -1686,6 +1686,15 @@ ieee80211_ifattach(struct ieee80211com *
+         qdf_timer_mod(&ic->ic_poll_q_util_timer,
+                          msecs_to_jiffies(ic->ic_poll_q_util_interval_ms));
+ 
++    /* At least some 10.4 firmwares are known to fail to change WAL channel if
++     * STA vap is vdev-restarted last if there are AP vaps present and were
++     * requested to vdev-restart to a new CSA channel as well.
++     *
++     * Note: This knob is not intended to be userspace controlled for purposes
++     * other than debugging!
++     */
++    ic->ic_csa_ordering = IEEE80211_CSA_ORDERING_STA_FIRST;
++
+     /* initialization complete */
+     ic->ic_initialized = 1;
+ 
+--- a/umac/mlme/ieee80211_beacon.c
++++ b/umac/mlme/ieee80211_beacon.c
+@@ -861,6 +861,7 @@ ieee80211_beacon_update(struct ieee80211
+ #endif /* ATH_SUPPORT_IBSS_DFS */
+     u_int8_t *frm = NULL;
+     struct ieee80211vap *tmp_vap = NULL;
++    int csa_ordering_cycle = 0;
+ 
+ 	if((curr_time - prev_store_beacon_time)>=INTERVAL_STORE_BEACON * NUM_MILLISEC_PER_SEC){
+ 		update_beacon_copy = true;
+@@ -1082,6 +1083,10 @@ ieee80211_beacon_update(struct ieee80211
+              *   takes care of the CAC automatically.
+              */
+ 
++            printk("%s: csa ordering %d\n", __func__, ic->ic_csa_ordering);
++csa_ordering:
++            printk("%s: csa ordering cycle %d\n", __func__, csa_ordering_cycle);
++
+             if (ic->ic_dfs_state.ignore_cac) {
+                 printk("%s: ignoring cac\n", __func__);
+                 goto ignore_cac;
+@@ -1099,6 +1104,22 @@ ignore_cac:
+                 ic_cw_width = ic->ic_cwm_get_width(ic);
+ 
+ 		TAILQ_FOREACH(tmp_vap, &ic->ic_vaps, iv_next) {
++		    switch (ic->ic_csa_ordering) {
++			case IEEE80211_CSA_ORDERING_NONE:
++			    break;
++			case IEEE80211_CSA_ORDERING_STA_FIRST:
++			    if ((tmp_vap->iv_opmode == IEEE80211_M_STA && csa_ordering_cycle == 1) ||
++			        (tmp_vap->iv_opmode != IEEE80211_M_STA && csa_ordering_cycle == 0))
++				continue;
++			    break;
++			case IEEE80211_CSA_ORDERING_STA_LAST:
++			    if ((tmp_vap->iv_opmode == IEEE80211_M_STA && csa_ordering_cycle == 0) ||
++			        (tmp_vap->iv_opmode != IEEE80211_M_STA && csa_ordering_cycle == 1))
++				continue;
++			    break;
++		    }
++		    printk("%s: csa ordering cycle %d vap %s\n", __func__, csa_ordering_cycle, tmp_vap->iv_netdev_name);
++
+ 		    if((tmp_vap->iv_opmode == IEEE80211_M_STA) && !ieee80211_vap_ready_is_set(tmp_vap)) {
+ 			STA_VAP_DOWNUP_LOCK(ic);
+ 			/* Only for main STA send the chanswitch complete event */
+@@ -1140,6 +1161,10 @@ ignore_cac:
+ 			}
+ 		    }
+ 		}
++		if (ic->ic_csa_ordering != IEEE80211_CSA_ORDERING_NONE && csa_ordering_cycle == 0) {
++			csa_ordering_cycle++;
++			goto csa_ordering;
++		}
+ 		tmp_vap = NULL;
+             } else {
+                 STA_VAP_DOWNUP_LOCK(ic);
+@@ -1172,6 +1197,12 @@ ignore_cac:
+                     ic->ic_curchan = c;
+                     ic_cw_width = ic->ic_cwm_get_width(ic);
+ 
++                    /* FIXME: CSA ordering should be applied here but STA vap
++                     * is not considered in the loop below at the time of
++                     * writing this comment. We're not using (nor relying) on
++                     * this flow now so it's fine..
++                     */
++
+                     TAILQ_FOREACH(tmp_vap, &ic->ic_vaps, iv_next) {
+                         if(tmp_vap->iv_opmode == IEEE80211_M_HOSTAP ||
+                                 tmp_vap->iv_opmode == IEEE80211_M_MONITOR ||

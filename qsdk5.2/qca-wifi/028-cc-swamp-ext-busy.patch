@@ -1,0 +1,95 @@
+--- a/hal/ar9300/ar9300_misc.c
++++ b/hal/ar9300/ar9300_misc.c
+@@ -1949,6 +1949,7 @@ ar9300_set_11n_mac2040(struct ath_hal *a
+     } else {
+         macmode = 0;
+     }
++    macmode |= AR_2040_SWAMPED;
+     OS_REG_WRITE(ah, AR_2040_MODE, macmode);
+ }
+ 
+--- a/hal/ar9300/ar9300reg.h
++++ b/hal/ar9300/ar9300reg.h
+@@ -1996,6 +1996,7 @@ enum {
+ /* MAC PCU global mode register */
+ #define AR_2040_MODE                    AR_MAC_PCU_OFFSET(MAC_PCU_20_40_MODE)
+ #define AR_2040_JOINED_RX_CLEAR         0x00000001   // use ctl + ext rx_clear for cca
++#define AR_2040_SWAMPED                 0x00000008   // increment ext rx_clear regardless of ctl power levels
+ 
+ /* MAC PCU H transfer timeout register */
+ #define AR_H_XFER_TIMEOUT               AR_MAC_PCU_OFFSET(MAC_PCU_H_XFER_TIMEOUT)
+--- a/offload/wlan/include/ol_if_athvar.h
++++ b/offload/wlan/include/ol_if_athvar.h
+@@ -38,6 +38,7 @@
+ #include "wmi_unified_api.h"
+ #include "htc_api.h"
+ #include "bmi_msg.h"
++#include "hif.h"
+ #include "ar_ops.h"
+ #if WLAN_FEATURE_FASTPATH
+ #include "ol_htt_api.h"
+@@ -867,6 +868,8 @@ int ol_ath_periodic_chan_stats_config(ol
+ 
+ void ol_ath_power_attach(struct ieee80211com *ic);
+ 
++void ol_plume_update_swamped_rx_clear(struct hif_opaque_softc *hif);
++
+ int ol_scan_update_channel_list(ieee80211_scanner_t ss);
+ 
+ struct ieee80211_channel *
+--- /dev/null
++++ b/offload/wlan/umac_offload_if/ol_if_plume.c
+@@ -0,0 +1,21 @@
++#include "hif.h"
++
++/* XXX: This is Peregrine specific */
++#define REG_ADDR 0x28318
++#define SWAMPED_FORCES_RX_CLEAR 0x8
++
++void ol_plume_update_swamped_rx_clear(struct hif_opaque_softc *hif)
++{
++	u32 val;
++	int err;
++
++	err = hif_diag_read_access(hif, REG_ADDR, &val);
++	if (err)
++		return;
++
++	val |= SWAMPED_FORCES_RX_CLEAR;
++
++	err = hif_diag_write_access(hif, REG_ADDR, val);
++	if (err)
++		return;
++}
+--- a/offload/wlan/umac_offload_if/ol_if_resmgr.c
++++ b/offload/wlan/umac_offload_if/ol_if_resmgr.c
+@@ -376,6 +376,8 @@ ol_vdev_wmi_event_handler(ol_scn_t sc, u
+ 
+     vaphandle = ol_ath_vap_get(scn, vdev_start_resp.vdev_id);
+ 
++    ol_plume_update_swamped_rx_clear(scn->hif_hdl);
++
+     if (NULL == vaphandle) {
+         printk("Event received for Invalid/Deleted vap handle\n");
+         return 0;
+--- a/offload/wlan/umac_offload_if/ol_if_scan.c
++++ b/offload/wlan/umac_offload_if/ol_if_scan.c
+@@ -1241,6 +1241,8 @@ ol_scan_process_event(ol_scn_t scn, wmi_
+     struct ieee80211_channel *chan;
+     u_int32_t freq;
+ 
++    ol_plume_update_swamped_rx_clear(scn->hif_hdl);
++
+     if ( wmi_scn_event->scan_id !=  ss->ss_scan_id ) {
+             IEEE80211_SCAN_PRINTF(ss, IEEE80211_MSG_ANY,
+                                       "%s: ignore scan event %d scan id  0x%x expected 0x%x \n",
+--- a/qca_ol/Kbuild
++++ b/qca_ol/Kbuild
+@@ -200,6 +200,7 @@ PERF_PWR_OFFLOAD_OBJS := $(PERF_PWR_OFFL
+ 				$(PERF_PWR_OFFLOAD_SRC)/wlan/umac_offload_if/ol_if_rtt.o \
+ 				$(PERF_PWR_OFFLOAD_SRC)/wlan/umac_offload_if/ol_if_lowi.o \
+ 				$(PERF_PWR_OFFLOAD_SRC)/wlan/umac_offload_if/ol_if_resmgr.o \
++				$(PERF_PWR_OFFLOAD_SRC)/wlan/umac_offload_if/ol_if_plume.o \
+ 				$(PERF_PWR_OFFLOAD_SRC)/misc/dbglog_host.o \
+ 				$(PERF_PWR_OFFLOAD_SRC)/os/linux/ol_ath_linux.o \
+ 				$(PERF_PWR_OFFLOAD_SRC)/os/linux/ol_ath_iw_handler.o \

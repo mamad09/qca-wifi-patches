@@ -1,0 +1,48 @@
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -4019,6 +4019,15 @@ ath_net80211_rx_aponly(ieee80211_handle_
+ 
+     ps_kapi_inc_rx_duration_ar900x(ic, rx_status, wbuf);
+ 
++#if ATH_BAND_STEERING
++    if (ni && (rx_status->flags & ATH_RX_RSSI_VALID)) {
++        if (ni->ni_last_record_rssi_jiffies != jiffies) {
++            ieee80211_bsteering_record_rssi(ni, rx_status->rssi);
++            ni->ni_last_record_rssi_jiffies = jiffies;
++        }
++    }
++#endif
++
+     /*
+      * Let ath_dev do some special rx frame processing. If the frame is not
+      * consumed by ath_dev, indicate it up to the stack.
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -7155,6 +7155,15 @@ ath_net80211_rx(ieee80211_handle_t ieee,
+ 
+     ps_kapi_inc_rx_duration_ar900x(ic, rx_status, wbuf);
+ 
++#if ATH_BAND_STEERING
++    if (ni && (rx_status->flags & ATH_RX_RSSI_VALID)) {
++        if (ni->ni_last_record_rssi_jiffies != jiffies) {
++            ieee80211_bsteering_record_rssi(ni, rx_status->rssi);
++            ni->ni_last_record_rssi_jiffies = jiffies;
++        }
++    }
++#endif
++
+     if (status != ATH_RX_CONSUMED) {
+         /*
+          * Not consumed by ath_dev for out-of-order delivery,
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -577,6 +577,9 @@ typedef struct ieee80211_node {
+     unsigned long ni_last_ack_age;
+     unsigned long ni_last_ack_cnt;
+     unsigned long ni_last_ack_jiffies;
++#if ATH_BAND_STEERING
++    unsigned long ni_last_record_rssi_jiffies;
++#endif
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 

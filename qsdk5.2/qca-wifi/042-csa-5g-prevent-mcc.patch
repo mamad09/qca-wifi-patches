@@ -1,0 +1,43 @@
+Impact: Prevents unstable links (high latency,
+high drop rate).
+
+Details: Peregrine host driver's resmgr doesn't
+check if the combined channel is "compatible". All
+vaps should always have the same control channel
+but in some cases umac state machine can drive
+Peregrine into a corner asking it to do the
+impossible. At that point firmware's resmgr jumps
+back and forth trying to fulfill the request but
+fails miserably.
+
+A real solution would be to sanitize channel
+management. This would require non-trivial and
+fairly big driver rework to introduce something
+akin to mac80211's channel contexts.
+
+This patch is probably susceptible to some races
+but it's still better than outright allowing
+impossible interface combinations.
+--- a/offload/wlan/umac_offload_if/ol_if_resmgr.c
++++ b/offload/wlan/umac_offload_if/ol_if_resmgr.c
+@@ -161,6 +161,20 @@ static int _ieee80211_resmgr_vap_start(i
+     }
+ #endif
+ 
++    if (restart == 0 &&
++        ic->ic_curchan &&
++        ic->ic_curchan->ic_ieee != chan->ic_ieee &&
++        ieee80211_vaps_active(ic) > 0) {
++        printk("%s: [%s, %i] refusing due to unsupported multi-chan (on: %d, req: %d)\n",
++               __func__,
++               vap->iv_netdev_name,
++               avn->av_if_id,
++               ic->ic_curchan->ic_ieee,
++               chan->ic_ieee);
++        spin_unlock_dpc(&vap->init_lock);
++        return -1;
++    }
++
+     /* BUG : Seen on AKronite, VDEV Start event response comes before setting
+      * av_ol_resmgr_wait to TRUE, this make VAP not coming up issue.
+      * Hence moving below assignment before sending VDEV_START_CMD_ID to target

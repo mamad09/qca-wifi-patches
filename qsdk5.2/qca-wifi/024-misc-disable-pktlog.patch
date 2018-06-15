@@ -1,0 +1,35 @@
+--- a/offload/os/linux/ol_ath_linux.c
++++ b/offload/os/linux/ol_ath_linux.c
+@@ -180,6 +180,12 @@ MODULE_PARM_DESC(OL_ACVOMinfree,
+         "offload : Min Free buffers reserved for AC-VO");
+ EXPORT_SYMBOL(OL_ACVOMinfree);
+ 
++unsigned int ol_disable_pktlog = 1;
++module_param(ol_disable_pktlog, uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
++MODULE_PARM_DESC(ol_disable_pktlog,
++                 "offload : disable pktlog [default=1]");
++EXPORT_SYMBOL(ol_disable_pktlog);
++
+ #ifdef AH_CAL_IN_FLASH_PCI
+ extern u_int32_t CalAddr[];
+ extern int pci_dev_cnt;
+--- a/offload/wmi/wmi_unified.c
++++ b/offload/wmi/wmi_unified.c
+@@ -118,7 +118,17 @@ wmi_unified_cmd_send(wmi_unified_t wmi_h
+ {
+     A_STATUS status;
+     struct cookie *cookie;
++    extern unsigned int ol_disable_pktlog;
+ 
++    if (ol_disable_pktlog &&
++        (cmd_id == WMI_PDEV_PKTLOG_ENABLE_CMDID ||
++         cmd_id == WMI_PDEV_PKTLOG_DISABLE_CMDID)) {
++        printk("%s: ignoring pktlog command '%s'\n",
++               __func__,
++               (cmd_id == WMI_PDEV_PKTLOG_ENABLE_CMDID
++                ? "enable" : "disable"));
++        return 0;
++    }
+ 
+ #if WMI_RECORDING
+     if (wmi_handle->wmi_enable) {

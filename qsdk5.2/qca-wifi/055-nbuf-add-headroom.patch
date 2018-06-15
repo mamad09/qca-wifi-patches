@@ -1,0 +1,22 @@
+--- a/os/linux/src/ath_wbuf.c
++++ b/os/linux/src/ath_wbuf.c
+@@ -328,9 +328,9 @@ ath_rxbuf_alloc(struct ath_softc *sc, u_
+          * in rx'd frames.
+          */
+ #if LIMIT_RXBUF_LEN_4K
+-        nbf = qdf_nbuf_alloc(NULL, len - NET_SKB_PAD, 0, 0, FALSE);
++        nbf = qdf_nbuf_alloc(NULL, len - NET_SKB_PAD + MIN_HEAD_ROOM, 0, 0, FALSE);
+ #else
+-        nbf = qdf_nbuf_alloc(NULL, len, 0, sc->sc_cachelsz, FALSE);
++        nbf = qdf_nbuf_alloc(NULL, len + MIN_HEAD_ROOM, 0, sc->sc_cachelsz, FALSE);
+ #endif
+         if (nbf == NULL)
+         {
+@@ -343,6 +343,7 @@ ath_rxbuf_alloc(struct ath_softc *sc, u_
+             nbuf_fail_limit_print++;
+             return NULL;
+         }
++        qdf_nbuf_reserve(nbf, MIN_HEAD_ROOM);
+ #if LIMIT_RXBUF_LEN_4K
+         if (unlikely((u_int32_t)(nbf->data) & (sc->sc_cachelsz - 1))) {
+             dump_stack();

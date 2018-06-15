@@ -1,0 +1,1570 @@
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -3,6 +3,8 @@
+ 
+ #include <ps_kapi_survey.h>
+ 
++DECLARE_EWMA(rx_rssi, 1024, 8)
++
+ struct ieee80211com;
+ struct ieee80211_node;
+ struct ieee80211_channel;
+@@ -29,12 +31,32 @@ struct ps_kapi_ctx {
+ 	struct ps_kapi_survey survey;
+ 	struct ps_kapi_q_util q_util;
+ 	struct ieee80211_channel *prev_chan;
++	struct ps_cmn_rate_info ri;
+ 	spinlock_t lock;
+ 	u64 next_peer_cookie;
++	u64 rx_ampdu_len;
+ 	u64 rx_duration_bss;
+ 	bool cc_old_valid;
+ };
+ 
++struct ps_kapi_peer_rx_stats {
++	u32 num_bytes;
++	u32 num_msdus;
++	u32 num_mpdus;
++	u32 num_retries;
++
++	struct {
++		u32 num_bytes;
++		u32 num_msdus;
++		u32 num_mpdus;
++		u32 num_ppdus;
++		u32 num_retries;
++		u32 num_sgi;
++		struct ewma_rx_rssi ave_rssi;
++		struct ewma_rx_rssi ave_rssi_ant[PS_MAX_RSSI_ANT][PS_MAX_RSSI_HT];
++	} stats[PS_MAX_ALL];
++};
++
+ void ps_kapi_cc_update(struct ieee80211com *ic);
+ void ps_kapi_handle_scan(struct ieee80211com *ic,
+ 			 struct _ieee80211_scan_event *event);
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -1,5 +1,6 @@
+ /* plume stats */
+ 
++#include <linux/average.h>
+ #include <linux/types.h>
+ #include <linux/bug.h>
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
+@@ -277,6 +278,79 @@ void ps_kapi_handle_scan(struct ieee8021
+ }
+ EXPORT_SYMBOL(ps_kapi_handle_scan);
+ 
++static struct ieee80211_node *
++ps_kapi_find_node(struct ieee80211_node_table *nt,
++		  const u8 addr[ETH_ALEN])
++{
++	struct ieee80211_node *ni;
++	int hash;
++
++	hash = IEEE80211_NODE_HASH(addr);
++	LIST_FOREACH(ni, &nt->nt_hash[hash], ni_hash)
++		if (IEEE80211_ADDR_EQ(ni->ni_macaddr, addr))
++			return ni;
++
++	return NULL;
++}
++
++static int ps_kapi_ioctl_get_peer_rx_stats(struct net_device *dev,
++					   struct iw_request_info *info,
++					   union iwreq_data *wrqu,
++					   char *extra,
++					   struct ps_uapi_ioctl *cmd)
++{
++	struct ieee80211com *ic;
++	struct ieee80211_node *ni;
++	struct ieee80211_node_table *nt;
++	struct ps_kapi_peer_rx_stats *src;
++	unsigned long flags;
++	rwlock_state_t lock_state;
++	int err;
++	int i;
++	int j;
++	int k;
++
++	ic = ath_netdev_priv(dev);
++	nt = &ic->ic_sta;
++
++	OS_BEACON_WRITE_LOCK(&nt->nt_nodelock, &lock_state, flags);
++
++	ni = ps_kapi_find_node(nt, cmd->u.peer_rx_stats.set.addr);
++	if (!ni) {
++		err = -ENOENT;
++		goto unlock;
++	}
++
++	src = &ni->ps_kapi_peer_rx_stats;
++
++	BUILD_BUG_ON(ARRAY_SIZE(cmd->u.peer_rx_stats.get.stats) !=
++		     ARRAY_SIZE(src->stats));
++
++	memset(&cmd->u.peer_rx_stats.get, 0, sizeof(cmd->u.peer_rx_stats.get));
++
++	cmd->u.peer_rx_stats.get.cookie = ni->ps_kapi_peer_cookie;
++
++	for (i = 0; i < ARRAY_SIZE(src->stats); i++) {
++		cmd->u.peer_rx_stats.get.stats[i].num_bytes = src->stats[i].num_bytes;
++		cmd->u.peer_rx_stats.get.stats[i].num_msdus = src->stats[i].num_msdus;
++		cmd->u.peer_rx_stats.get.stats[i].num_mpdus = src->stats[i].num_mpdus;
++		cmd->u.peer_rx_stats.get.stats[i].num_ppdus = src->stats[i].num_ppdus;
++		cmd->u.peer_rx_stats.get.stats[i].num_retries = src->stats[i].num_retries;
++		cmd->u.peer_rx_stats.get.stats[i].num_sgi = src->stats[i].num_sgi;
++		cmd->u.peer_rx_stats.get.stats[i].ave_rssi = ewma_rx_rssi_read(&src->stats[i].ave_rssi);
++		for (j = 0; j < PS_MAX_RSSI_ANT; j++)
++			for (k = 0; k < PS_MAX_RSSI_HT; k++)
++				cmd->u.peer_rx_stats.get.stats[i].ave_rssi_ant[j][k] = ewma_rx_rssi_read(&src->stats[i].ave_rssi_ant[j][k]);
++	}
++
++	err = 0;
++
++unlock:
++	OS_BEACON_WRITE_UNLOCK(&nt->nt_nodelock, &lock_state, flags);
++
++	return err;
++}
++
+ static int ps_kapi_ioctl_get_survey_chan(struct net_device *dev,
+ 					 struct iw_request_info *info,
+ 					 union iwreq_data *wrqu,
+@@ -401,6 +475,7 @@ typedef int (*ps_kapi_ioctl_op)(struct n
+ 				struct ps_uapi_ioctl *cmd);
+ 
+ static const ps_kapi_ioctl_op get_ops[PS_UAPI_IOCTL_CMD_MAX] = {
++	[PS_UAPI_IOCTL_CMD_PEER_RX_STATS] = ps_kapi_ioctl_get_peer_rx_stats,
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_CHAN] = ps_kapi_ioctl_get_survey_chan,
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_BSS] = ps_kapi_ioctl_get_survey_bss,
+ 	[PS_UAPI_IOCTL_CMD_Q_UTIL] = ps_kapi_ioctl_get_q_util,
+@@ -454,12 +529,23 @@ void ps_kapi_peer_init(struct ieee80211c
+ 		       struct ieee80211_node *ni)
+ {
+ 	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	struct ps_kapi_peer_rx_stats *rxs = &ni->ps_kapi_peer_rx_stats;
++	int i;
++	int j;
++	int k;
+ 
+ 	/* Note: Locking is assumed to be taken appropriately by the caller. In
+ 	 * pratice this is in context of ieee80211_node creation which is
+ 	 * locked properly already.
+ 	 */
+ 	ni->ps_kapi_peer_cookie = ctx->next_peer_cookie++;
++
++	for (i = 0; i < ARRAY_SIZE(rxs->stats); i++) {
++		ewma_rx_rssi_init(&rxs->stats[i].ave_rssi);
++		for (j = 0; j < PS_MAX_RSSI_ANT; j++)
++			for (k = 0; k < PS_MAX_RSSI_HT; k++)
++				ewma_rx_rssi_init(&rxs->stats[i].ave_rssi_ant[j][k]);
++	}
+ }
+ EXPORT_SYMBOL(ps_kapi_peer_init);
+ 
+--- a/offload/wlan/txrx/ol_rx.c
++++ b/offload/wlan/txrx/ol_rx.c
+@@ -43,6 +43,8 @@
+ #undef QCA_PARTNER_DIRECTLINK_OL_RX
+ #endif
+ 
++#include <htt_internal.h> /* htt_rx_desc */
++
+ extern void transcap_nwifi_to_8023(qdf_nbuf_t msdu);
+ #if MESH_MODE_SUPPORT
+ void ol_rx_mesh_mode_per_pkt_rx_info(qdf_nbuf_t nbuf, struct ol_txrx_peer_t *peer, struct ol_txrx_vdev_t *vdev)
+@@ -380,6 +382,201 @@ int ol_ath_wnm_update_bssidle_time( stru
+ #endif
+ 
+ void
++ps_kapi_inc_rx_rssi(struct ieee80211com *ic,
++                    struct ps_kapi_peer_rx_stats *stats,
++                    void *rxd,
++                    int rix)
++{
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_txrx_pdev_t *pdev;
++    struct htt_pdev_t *htt_pdev;
++    struct ar_rx_desc_ops *ar_rx_ops;
++    u32 *ptr;
++    u32 rssi;
++    int chain;
++    int ht;
++    int co;
++    int cm;
++    int cs;
++
++    scn = OL_ATH_SOFTC_NET80211(ic);
++    pdev = scn->pdev_txrx_handle;
++    htt_pdev = pdev->htt_pdev;
++    ar_rx_ops = htt_pdev->ar_rx_ops;
++
++    if (unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->get_rssi))))
++        return;
++
++    ptr = ar_rx_ops->get_rssi(rxd, &co, &cm, &cs);
++    rssi = (ptr[co] & cm) >> cs;
++
++    ewma_rx_rssi_add(&stats->stats[rix].ave_rssi, rssi);
++
++    for (chain = 0; chain < 4; chain++) {
++        for (ht = 0; ht < 4; ht++) {
++            rssi = ptr[chain];
++            rssi >>= ht * 8;
++            rssi &= 0xff;
++
++            if (rssi & 0x80)
++                continue;
++
++            ewma_rx_rssi_add(&stats->stats[rix].ave_rssi_ant[chain][ht], rssi);
++        }
++    }
++}
++
++static void
++ps_kapi_inc_rx_duration(struct ieee80211com *ic,
++                        struct ieee80211_node *ni,
++                        qdf_nbuf_t head_msdu,
++                        qdf_nbuf_t tail_msdu,
++                        int num_msdus)
++{
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_txrx_pdev_t *pdev;
++    struct htt_pdev_t *htt_pdev;
++    struct ar_rx_desc_ops *ar_rx_ops;
++    struct ps_kapi_ctx *ctx;
++    struct ps_cmn_rate_info *ri;
++    qdf_nbuf_t msdu;
++    bool first_mpdu;
++    bool bad_fcs;
++    void *rxd;
++    int dur;
++    u32 num_bytes;
++
++    if (!num_msdus)
++        return;
++
++    scn = OL_ATH_SOFTC_NET80211(ic);
++    pdev = scn->pdev_txrx_handle;
++    htt_pdev = pdev->htt_pdev;
++    ar_rx_ops = htt_pdev->ar_rx_ops;
++
++    if (unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_first_mpdu))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_fcs_err))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->get_cmn_ri))))
++        return;
++
++    ctx = &ic->ps_kapi_ctx;
++    ri = &ctx->ri;
++    rxd = htt_rx_desc(head_msdu);
++    first_mpdu = ar_rx_ops->is_first_mpdu(rxd);
++    bad_fcs = ar_rx_ops->is_fcs_err(rxd);
++
++    if (first_mpdu)
++        ar_rx_ops->get_cmn_ri(rxd, ri);
++
++    msdu = head_msdu;
++    num_bytes = 0;
++    do {
++        num_bytes += msdu->len;
++        msdu = msdu->next;
++    } while (msdu);
++
++    dur = ps_cmn_pkt_duration(ri, first_mpdu, num_bytes);
++    if (dur < 0)
++        return;
++
++    if (ni)
++        ACCESS_ONCE(ctx->rx_duration_bss) += dur;
++}
++
++static void
++ol_ps_kapi_inc_rx_stats(struct ieee80211com *ic,
++                        struct ieee80211_node *ni,
++                        qdf_nbuf_t head_msdu,
++                        qdf_nbuf_t tail_msdu,
++                        int num_msdus,
++                        int msdu_chaining)
++{
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_txrx_pdev_t *pdev;
++    struct htt_pdev_t *htt_pdev;
++    struct ar_rx_desc_ops *ar_rx_ops;
++    struct ps_kapi_peer_rx_stats *stats;
++    struct ps_cmn_rate_info ri = {};
++    qdf_nbuf_t msdu;
++    int rix;
++    bool first_mpdu;
++    bool is_data;
++    bool is_retry;
++    bool bad_fcs;
++    void *rxd;
++
++    if (!num_msdus)
++        return;
++
++    scn = OL_ATH_SOFTC_NET80211(ic);
++    pdev = scn->pdev_txrx_handle;
++    htt_pdev = pdev->htt_pdev;
++    ar_rx_ops = htt_pdev->ar_rx_ops;
++
++    if (unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_data))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_first_mpdu))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_retry))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_fcs_err))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->get_cmn_ri))))
++        return;
++
++    rxd = htt_rx_desc(head_msdu);
++    stats = &ni->ps_kapi_peer_rx_stats;
++    is_data = ar_rx_ops->is_data(rxd);
++    first_mpdu = ar_rx_ops->is_first_mpdu(rxd);
++    is_retry = ar_rx_ops->is_retry(rxd);
++    bad_fcs = ar_rx_ops->is_fcs_err(rxd);
++
++    if (first_mpdu) {
++        ar_rx_ops->get_cmn_ri(rxd, &ri);
++        ic->ps_kapi_rix = ps_cmn_calc_rix(&ri);
++        ic->ps_kapi_sgi = ri.sgi;
++        ic->ps_kapi_first_mpdu = 1;
++    }
++
++    /* Reporting non-data frames (management, control) would introduce extra
++     * ofdm/cck counters. This probably makes no sense and could interfere with
++     * RF assessement.
++     */
++    if (!is_data)
++        return;
++
++    /* Firmware apparently reports invalid peer_id in some cases which can
++     * lead to incorrect accounting.
++     */
++    if (bad_fcs)
++        return;
++
++    if (!ni)
++        return;
++
++    rix = ic->ps_kapi_rix;
++
++    if (ic->ps_kapi_first_mpdu) {
++        ic->ps_kapi_first_mpdu = 0;
++
++        stats->stats[rix].num_ppdus++;
++
++        if (ic->ps_kapi_sgi)
++            stats->stats[rix].num_sgi++;
++
++        ps_kapi_inc_rx_rssi(ic, stats, rxd, rix);
++    }
++
++    if (is_retry)
++        stats->stats[rix].num_retries++;
++
++    msdu = head_msdu;
++    do {
++        stats->stats[rix].num_bytes += msdu->len;
++        stats->stats[rix].num_msdus++;
++        msdu = msdu->next;
++    } while (msdu);
++
++    stats->stats[rix].num_mpdus++;
++}
++
++void
+ ol_rx_indication_handler(
+     ol_txrx_pdev_handle pdev,
+     qdf_nbuf_t rx_ind_msg,
+@@ -395,6 +592,8 @@ ol_rx_indication_handler(
+     int skip_monitor =0;
+     struct ieee80211_mac_stats *mac_stats;
+     struct ieee80211vap *vap = NULL;
++    struct ieee80211com *ic;
++    struct ieee80211_node *ni = NULL;
+     struct ethhdr * eh;
+     struct ieee80211_frame *wh;
+     struct ol_ath_softc_net80211 *scn = NULL;
+@@ -412,11 +611,17 @@ ol_rx_indication_handler(
+ 
+ 
+     scn = (struct ol_ath_softc_net80211 *)pdev->ctrl_pdev;
++    ic = &scn->sc_ic;
+ 
+     htt_pdev = pdev->htt_pdev;
+     peer = ol_txrx_peer_find_by_id(pdev, peer_id);
+     if (peer) {
+         vdev = peer->vdev;
++        if (vdev) {
++            vap = ol_ath_vap_get(scn, vdev->vdev_id);
++            if (vap)
++                ni = ieee80211_vap_find_node(vap, peer->mac_addr.raw);
++        }
+     }
+ 
+ #if RX_DEBUG
+@@ -525,6 +730,18 @@ ol_rx_indication_handler(
+ #endif
+                     rx_ind_msg, &head_msdu, &tail_msdu, &npackets);
+ 
++                ps_kapi_inc_rx_duration(ic,
++                                        ni,
++                                        head_msdu,
++                                        tail_msdu,
++                                        npackets);
++
++                ol_ps_kapi_inc_rx_stats(ic,
++                                        ni,
++                                        head_msdu,
++                                        tail_msdu,
++                                        npackets,
++                                        msdu_chaining);
+ #if QCA_PARTNER_DIRECTLINK
+                 /*
+                  * For Direct Link RX, htt_rx_msdu_desc_retrieve() would finally
+@@ -736,12 +953,26 @@ ol_rx_indication_handler(
+                         vdev,
+ #endif
+                         rx_ind_msg, &msdu, &tail_msdu, &npackets);
++
++                ps_kapi_inc_rx_duration(ic,
++                                        ni,
++                                        msdu,
++                                        tail_msdu,
++                                        npackets);
++
++                ol_ps_kapi_inc_rx_stats(ic,
++                                        ni,
++                                        msdu,
++                                        tail_msdu,
++                                        npackets,
++                                        msdu_chaining);
++
+ #if RX_DEBUG
+                 if (!npackets) {
+                     if ( skip_monitor == 0 ) {
+                         qdf_spin_unlock(&pdev->mon_mutex);
+                     }
+-                    return;
++                    goto out;
+                 }
+ #endif
+ #if QCA_PARTNER_DIRECTLINK
+@@ -872,6 +1103,12 @@ normalproc:
+     if ( skip_monitor == 0) {
+         qdf_spin_unlock(&pdev->mon_mutex);
+     }
++
++out:
++    if (ni) {
++        ieee80211_free_node(ni);
++        ni = NULL;
++    }
+ }
+ 
+ void
+--- a/os/linux/src/ath_iw_handler.c
++++ b/os/linux/src/ath_iw_handler.c
+@@ -49,6 +49,7 @@
+ #include "ah.h"
+ #include "asf_amem.h"
+ #include "ath_ucfg.h"
++#include <linux/average.h>
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+ 
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -66,6 +66,11 @@
+ #include "ath_airtime_fairness.h"
+ #endif
+ 
++#include <linux/average.h>
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ #if UMAC_SUPPORT_APONLY
+ 
+ #if ATH_SUPPORT_KEYPLUMB_WAR
+@@ -2955,6 +2960,12 @@ ieee80211_input_update_data_stats_aponly
+                                          - IEEE80211_CRC_LEN);
+ }
+ 
++extern void
++ps_kapi_inc_rx_stats(struct ieee80211_node *ni,
++                     struct ieee80211_rx_status *rs,
++                     int num_msdus,
++                     int num_bytes);
++
+  /*
+   * processes data frames.
+   * ieee80211_input_data consumes the wbuf .
+@@ -3170,6 +3181,7 @@ ieee80211_input_data_aponly(struct ieee8
+     ieee80211_input_update_data_stats_aponly(ni, mac_stats, wbuf, rs, hdrsize);
+ 
+     /* consumes the wbuf */
++    ps_kapi_inc_rx_stats(ni, rs, 1, wbuf_get_pktlen(wbuf));
+     ieee80211_deliver_data_aponly(vap, wbuf, ni, rs, hdrspace, is_mcast, subtype);
+ out:
+     return;
+@@ -3980,6 +3992,8 @@ ath_net80211_rx_aponly(ieee80211_handle_
+     }
+ #endif
+ 
++    ps_kapi_inc_rx_duration_ar900x(ic, rx_status, wbuf);
++
+     /*
+      * Let ath_dev do some special rx frame processing. If the frame is not
+      * consumed by ath_dev, indicate it up to the stack.
+--- a/umac/base/ieee80211_node.c
++++ b/umac/base/ieee80211_node.c
+@@ -17,6 +17,7 @@
+ #include <if_smart_ant.h>
+ #include <mlme/ieee80211_mlme_priv.h>
+ 
++#include <linux/average.h>
+ #include <net/iw_handler.h>
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -54,6 +54,11 @@ extern unsigned long ath_ignoredfs_enabl
+ 
+ extern void ieee80211_cts_done(bool txok);
+ 
++#include <linux/average.h>
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ #if ATH_SUPPORT_WRAP
+ /*
+  * WRAP hardware crypto configuration options.
+@@ -7161,6 +7166,8 @@ ath_net80211_rx(ieee80211_handle_t ieee,
+ 	}
+     }
+ 
++    ps_kapi_inc_rx_duration_ar900x(ic, rx_status, wbuf);
++
+     if (status != ATH_RX_CONSUMED) {
+         /*
+          * Not consumed by ath_dev for out-of-order delivery,
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -28,6 +28,11 @@
+ #include <ieee80211_ald.h>
+ #include <ieee80211_ioctl.h>
+ 
++#include <linux/average.h>
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ /* Forward declarations */
+ struct ieee80211com;
+ struct ieee80211vap;
+@@ -562,6 +567,7 @@ typedef struct ieee80211_node {
+     u_int8_t    ni_fils_aead_set;      /* Set when FILS AEAD parameters are set */
+ #endif
+     u64 ps_kapi_peer_cookie;
++    struct ps_kapi_peer_rx_stats ps_kapi_peer_rx_stats;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -96,6 +96,7 @@
+ 
+ #include <sys/queue.h>
+ 
++#include <linux/average.h>
+ #include <net/iw_handler.h>
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+@@ -1895,6 +1896,9 @@ int (*ic_print_scan_config)(wlan_if_t va
+     struct ps_kapi_ctx                  ps_kapi_ctx;
+     int                                 ic_poll_q_util_interval_ms;
+     unsigned long                       (*ic_poll_q_util)(struct ieee80211com *ic);
++    int                                 ps_kapi_rix;
++    int                                 ps_kapi_sgi;
++    int                                 ps_kapi_first_mpdu;
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/umac/mlme/ieee80211_bssload.c
++++ b/umac/mlme/ieee80211_bssload.c
+@@ -17,6 +17,7 @@
+ #include <ieee80211_var.h>
+ #include "ieee80211_bssload.h"
+ 
++#include <linux/average.h>
+ #include <net/iw_handler.h>
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+--- a/umac/mlme/ieee80211_proto.c
++++ b/umac/mlme/ieee80211_proto.c
+@@ -22,6 +22,7 @@
+ #include <if_smart_ant.h>
+ #include "ieee80211_sme_api.h"
+ 
++#include <linux/average.h>
+ #include <net/iw_handler.h>
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+--- a/umac/txrx/ieee80211_input.c
++++ b/umac/txrx/ieee80211_input.c
+@@ -253,6 +253,175 @@ ieee80211_check_privacy_filters(struct i
+     return FILTER_STATUS_REJECT;
+ }
+ 
++/* XXX
++ *
++ * The following function parses rs_ratephy which is hardware rx-status
++ * descriptor specific.
++ *
++ * Current implementation is specific to ath9k family chips. ath5k family chips
++ * are not supported (and it makes little sense to).
++ */
++
++void
++ps_kapi_fill_ri(struct ps_cmn_rate_info *ri,
++                int ratephy,
++                int ht40,
++                int sgi,
++                int stbc)
++{
++    static const u8 legacy2rix[] = {
++        /* rates are sorted by mbps in ascending order
++         * translates internal hw indices to our stat common rix
++         */
++
++        /* cck long */
++        [0x1b] = 0,
++        [0x1a] = 1,
++        [0x19] = 2,
++        [0x18] = 3,
++
++        /* cck short */
++        [0x1a + 0x4] = 4,
++        [0x19 + 0x4] = 5,
++        [0x18 + 0x4] = 6,
++
++        /* ofdm */
++        [0x0b] = 0,
++        [0x0f] = 1,
++        [0x0a] = 2,
++        [0x0e] = 3,
++        [0x09] = 4,
++        [0x0d] = 5,
++        [0x08] = 6,
++        [0x0c] = 7,
++    };
++
++    if (ratephy & 0x80) {
++        ri->is_ht = 1;
++        ri->stbc = stbc;
++        ri->mcs = ratephy & 0x7f;
++        ri->nss = ri->mcs / 8;
++        ri->mcs = ri->mcs % 8;
++
++        if (ht40)
++            ri->bw = 1;
++
++        if (sgi)
++            ri->sgi = 1;
++    } else {
++        if (ratephy >= ARRAY_SIZE(legacy2rix)) {
++            WARN_ON_ONCE(1);
++            return;
++        }
++
++        if (ratephy < ARRAY_SIZE(legacy2rix))
++            ri->mcs = legacy2rix[ratephy];
++
++        if (ratephy & 0x10)
++            ri->is_cck = 1;
++    }
++}
++
++void
++ps_kapi_inc_rx_duration_ar900x(struct ieee80211com *ic,
++                               ieee80211_rx_status_t *rxs,
++                               wbuf_t wbuf)
++{
++    struct ps_cmn_rate_info ri = {};
++    int pkt_dur;
++
++    ic->ps_kapi_ctx.rx_ampdu_len += wbuf_get_pktlen(wbuf);
++
++    if (!rxs->isaggr || rxs->nomoreaggr) {
++        ps_kapi_fill_ri(&ri,
++                        rxs->ratecode,
++                        rxs->flags & ATH_RX_40MHZ,
++                        rxs->flags & ATH_RX_SHORT_GI,
++                        rxs->stbc);
++        pkt_dur = ps_cmn_pkt_duration(&ri, true, ic->ps_kapi_ctx.rx_ampdu_len);
++        if (pkt_dur > 0)
++            ACCESS_ONCE(ic->ps_kapi_ctx.rx_duration_bss) += pkt_dur;
++
++        ic->ps_kapi_ctx.rx_ampdu_len = 0;
++    }
++}
++EXPORT_SYMBOL(ps_kapi_inc_rx_duration_ar900x);
++
++static void
++ps_kapi_rs_to_ri(struct ps_cmn_rate_info *ri,
++                 const struct ieee80211_rx_status *rs)
++{
++    ps_kapi_fill_ri(ri,
++                    rs->rs_ratephy1,
++                    rs->ps_ht40,
++                    rs->ps_sgi,
++                    rs->rs_stbc);
++}
++
++void
++ps_kapi_inc_rx_stats(struct ieee80211_node *ni,
++                     struct ieee80211_rx_status *rs,
++                     int num_msdus,
++                     int num_bytes)
++{
++    struct ieee80211com *ic;
++    struct ps_kapi_peer_rx_stats *stats;
++    struct ps_cmn_rate_info ri = {};
++    bool is_last_mpdu;
++    int rix;
++
++    ic = ni->ni_ic;
++    stats = &ni->ps_kapi_peer_rx_stats;
++
++    stats->num_mpdus++;
++    stats->num_msdus += num_msdus;
++    stats->num_bytes += num_bytes;
++
++    if (rs->rs_isretry)
++        stats->num_retries++;
++
++    if (!rs->rs_isaggr)
++        is_last_mpdu = true;
++    else if (!rs->rs_moreaggr)
++        is_last_mpdu = true;
++    else
++        is_last_mpdu = false;
++
++    if (is_last_mpdu) {
++        ps_kapi_rs_to_ri(&ri, rs);
++        rix = ps_cmn_calc_rix(&ri);
++
++        if (ri.sgi)
++            stats->stats[rix].num_sgi++;
++
++        stats->stats[rix].num_ppdus++;
++        stats->stats[rix].num_mpdus += stats->num_mpdus;
++        stats->stats[rix].num_msdus += stats->num_msdus;
++        stats->stats[rix].num_bytes += stats->num_bytes;
++        stats->stats[rix].num_retries += stats->num_retries;
++        stats->num_mpdus = 0;
++        stats->num_msdus = 0;
++        stats->num_bytes = 0;
++        stats->num_retries = 0;
++    }
++
++    if (rs->rs_isvalidrssi) {
++        ewma_rx_rssi_add(&stats->stats[rix].ave_rssi, rs->rs_rssi);
++
++#define ANT_RSSI(chain, ht, x) \
++        if ((x) != 0x80 && (x) != 0) \
++            ewma_rx_rssi_add(&stats->stats[rix].ave_rssi_ant[chain][ht], (x))
++        ANT_RSSI(0, 0, rs->rs_rssictl[0]);
++        ANT_RSSI(1, 0, rs->rs_rssictl[1]);
++        ANT_RSSI(2, 0, rs->rs_rssictl[2]);
++        ANT_RSSI(0, 1, rs->rs_rssiextn[0]);
++        ANT_RSSI(1, 1, rs->rs_rssiextn[1]);
++        ANT_RSSI(2, 1, rs->rs_rssiextn[2]);
++#undef ANT_RSSI
++    }
++}
++EXPORT_SYMBOL(ps_kapi_inc_rx_stats);
++
+ int
+ ieee80211_amsdu_input(struct ieee80211_node *ni, 
+                       wbuf_t wbuf, struct ieee80211_rx_status *rs,
+@@ -268,6 +437,8 @@ ieee80211_amsdu_input(struct ieee80211_n
+     u_int32_t hdrsize;
+     wbuf_t wbuf_new, wbuf_subfrm, wbuf_save = wbuf;
+     struct ieee80211_qosframe_addr4 *wh;
++    int num_msdus = 0;
++    int num_bytes = 0;
+     u_int16_t orig_hdrsize = 0;
+     u_int reserve = 64; /* MIN_HEAD_ROOM as defined in ath_wbuf.c*/
+ #if !ATH_SUPPORT_STATS_APONLY
+@@ -446,6 +617,8 @@ ieee80211_amsdu_input(struct ieee80211_n
+         }
+ #endif
+         mac_stats->ims_rx_datapyld_bytes += subfrm_len;
++        num_msdus++;
++        num_bytes += wbuf_get_pktlen(wbuf_subfrm);
+         
+         if (ieee80211_check_privacy_filters(ni, wbuf_subfrm, is_mcast) == FILTER_STATUS_REJECT) {
+             wbuf_free(wbuf_subfrm);
+@@ -479,6 +652,8 @@ ieee80211_amsdu_input(struct ieee80211_n
+     }
+ #endif
+ 
++    ps_kapi_inc_rx_stats(ni, rs, num_msdus, num_bytes);
++
+ err_amsdu:
+     while (wbuf_save) {
+ 	wbuf = wbuf_next(wbuf_save);
+@@ -1127,6 +1302,7 @@ ieee80211_input_data(struct ieee80211_no
+ 
+     IEEE80211_INPUT_UPDATE_DATA_STATS(ni, mac_stats, wbuf, rs, realhdrsize);
+     /* consumes the wbuf */
++    ps_kapi_inc_rx_stats(ni, rs, 1, wbuf_get_pktlen(wbuf));
+     ieee80211_deliver_data(vap, wbuf, ni, rs, hdrspace, is_mcast, subtype);
+ 
+ out:
+--- a/umac/include/ieee80211_data.h
++++ b/umac/include/ieee80211_data.h
+@@ -15,6 +15,7 @@
+ 
+ 
+ struct ieee80211_tx_status;
++struct ps_cmn_rate_info;
+ 
+ int ieee80211_send_wbuf(struct ieee80211vap *vap,struct ieee80211_node *ni, wbuf_t wbuf);
+ int ieee80211_input(struct ieee80211_node *ni, wbuf_t wbuf, struct ieee80211_rx_status *rs);
+@@ -54,6 +55,11 @@ bool ieee80211_is_txq_empty(struct ieee8
+ int  ieee80211_classify(struct ieee80211_node *ni, wbuf_t wbuf);
+ int  ieee80211_amsdu_input(struct ieee80211_node *ni, wbuf_t wbuf, struct ieee80211_rx_status *rs,
+                       int is_mcast, u_int8_t subtype);
++void ps_kapi_fill_ri(struct ps_cmn_rate_info *ri,
++                     int ratephy,
++                     int ht40,
++                     int sgi,
++                     int stbc);
+ 
+ #ifdef ENCAP_OFFLOAD
+ #define ieee80211_encap( _ni , _wbuf)   (_wbuf)
+--- a/umac/if_lmac/if_athvar.h
++++ b/umac/if_lmac/if_athvar.h
+@@ -291,6 +291,9 @@ ath_node_set_fixedrate_proc(struct ath_s
+     ic->ic_ieee80211_unref_node (ni);
+     return;
+ }
++void ps_kapi_inc_rx_duration_ar900x(struct ieee80211com *ic,
++                                    ieee80211_rx_status_t *rxs,
++                                    wbuf_t wbuf);
+ 
+ #define ATH_DEFINE_TXCTL(_txctl, _wbuf)    \
+     ieee80211_tx_control_t ltxctl;         \
+--- a/os/linux/src/osif_nss_wifiol_vdev_if.c
++++ b/os/linux/src/osif_nss_wifiol_vdev_if.c
+@@ -932,10 +932,16 @@ static void osif_nss_vdev_special_data_r
+  */
+ bool osif_nss_ni_stats_update(struct ol_ath_softc_net80211 *scn, struct sk_buff * nbuf, void *rx_mpdu_desc, uint8_t htt_rx_status, struct nss_wifi_append_statsv2_metahdr *metaheader)
+ {
++    extern void ps_kapi_inc_rx_rssi(struct ieee80211com *ic, struct ps_kapi_peer_rx_stats *stats, void *rxd, int rix);
+     struct ol_txrx_vdev_t *vdev = NULL;
+     struct ieee80211vap *vap;
++    struct ieee80211com *ic;
++    struct ps_kapi_peer_rx_stats *stats;
+     struct ieee80211_mac_stats *mac_stats;
+     struct ieee80211_node *ni = NULL;
++    struct ps_cmn_rate_info ri = {};
++    struct ps_kapi_ctx *ctx;
++    struct ar_rx_desc_ops *ar_rx_ops;
+     uint64_t msdus = metaheader->num_msdus;
+     uint64_t bytes = metaheader->num_bytes;
+     uint64_t retries = metaheader->num_retries;
+@@ -943,6 +949,8 @@ bool osif_nss_ni_stats_update(struct ol_
+     uint16_t peer_id = metaheader->peer_id;
+     struct ol_txrx_pdev_t *pdev = scn->pdev_txrx_handle;
+     int is_mcast;
++    int rix;
++    int dur;
+     struct ol_txrx_peer_t *peer = (peer_id == HTT_INVALID_PEER) ?
+         NULL : pdev->peer_id_to_obj_map[peer_id];
+ 
+@@ -970,6 +978,32 @@ bool osif_nss_ni_stats_update(struct ol_
+             &vap->iv_unicast_stats;
+     }
+ 
++    ic = &scn->sc_ic;
++    ctx = &ic->ps_kapi_ctx;
++    ar_rx_ops = pdev->htt_pdev->ar_rx_ops;
++
++    if (likely(!WARN_ON_ONCE(unlikely(!ar_rx_ops->get_cmn_ri))))
++        ar_rx_ops->get_cmn_ri(rx_mpdu_desc, &ri);
++    rix = ps_cmn_calc_rix(&ri);
++
++    if (ni) {
++        dur = ps_cmn_pkt_duration(&ri, 1, bytes);
++        ACCESS_ONCE(ctx->rx_duration_bss) += dur;
++
++        stats = &ni->ps_kapi_peer_rx_stats;
++        stats->stats[rix].num_bytes += bytes;
++        stats->stats[rix].num_msdus += msdus;
++        stats->stats[rix].num_mpdus += mpdus;
++        stats->stats[rix].num_retries += retries;
++
++        if (htt_rx_status == HTT_RX_IND_MPDU_STATUS_OK) {
++            stats->stats[rix].num_ppdus++;
++            if (ri.sgi)
++                stats->stats[rix].num_sgi++;
++            ps_kapi_inc_rx_rssi(ic, stats, rx_mpdu_desc, rix);
++        }
++    }
++
+     switch (htt_rx_status) {
+         case HTT_RX_IND_MPDU_STATUS_OK:
+             if (peer) {
+--- a/offload/hw/AR9888/rx_desc.c
++++ b/offload/hw/AR9888/rx_desc.c
+@@ -125,6 +125,192 @@ FN_RX_DESC_GET_SMART_ANT_STATS(ar9888)
+ FN_RX_DESC_UPDATE_PKT_INFO(ar9888)
+ #endif
+ 
++static int
++_ar9888_rx_desc_is_data(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return !(ptr[0] & (RX_ATTENTION_0_NULL_DATA_MASK |
++                       RX_ATTENTION_0_MGMT_TYPE_MASK |
++                       RX_ATTENTION_0_CTRL_TYPE_MASK));
++}
++
++static int
++_ar9888_rx_desc_is_first_mpdu(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return ptr[0] & RX_ATTENTION_0_FIRST_MPDU_MASK;
++}
++
++static int
++_ar9888_rx_desc_is_retry(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->mpdu_start;
++    return ptr[0] & RX_MPDU_START_0_RETRY_MASK;
++}
++
++static int
++_ar9888_rx_desc_is_fcs_err(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return ptr[0] & RX_ATTENTION_0_FCS_ERR_MASK;
++}
++
++static void
++_ar9888_rx_desc_get_cmn_ri(void *_rxd,
++                           struct ps_cmn_rate_info *ri)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    u32 ht_sig_1;
++    u32 ht_sig_2;
++    u32 group_id;
++    u32 preamble;
++    enum {
++        PREAMBLE_LEGACY    =  0x4,
++        PREAMBLE_HT        =  0x8,
++        PREAMBLE_HT_TXBF   =  0x9,
++        PREAMBLE_VHT       =  0xc,
++        PREAMBLE_VHT_TXBF  =  0xd,
++    };
++    enum {
++        OFDM_48M = 0,
++        OFDM_24M,
++        OFDM_12M,
++        OFDM_6M,
++        OFDM_54M,
++        OFDM_36M,
++        OFDM_18M,
++        OFDM_9M,
++    };
++    enum {
++        CCK_LONG_11M = 0,
++        CCK_LONG_5M,
++        CCK_LONG_2M,
++        CCK_LONG_1M,
++        CCK_SHORT_11M,
++        CCK_SHORT_5M,
++        CCK_SHORT_2M,
++    };
++    static const u8 ofdm2rix[8] = {
++        [OFDM_48M]  =  6,
++        [OFDM_24M]  =  4,
++        [OFDM_12M]  =  2,
++        [OFDM_6M]   =  0,
++        [OFDM_54M]  =  7,
++        [OFDM_36M]  =  5,
++        [OFDM_18M]  =  3,
++        [OFDM_9M]   =  1,
++    };
++    static const u8 cck2rix[8] = {
++        [CCK_LONG_11M]   =  3,
++        [CCK_LONG_5M]    =  2,
++        [CCK_LONG_2M]    =  1,
++        [CCK_LONG_1M]    =  0,
++        [CCK_SHORT_11M]  =  6,
++        [CCK_SHORT_5M]   =  5,
++        [CCK_SHORT_2M]   =  4,
++    };
++
++    rxd = _rxd;
++    ptr = (u32 *)&rxd->ppdu_start;
++
++    /* hw reports both vht_sig_a and ht_sig in the same spot */
++    ht_sig_1 = ptr[RX_PPDU_START_6_HT_SIG_VHT_SIG_A_1_OFFSET / sizeof(u32)];
++    ht_sig_2 = ptr[RX_PPDU_START_7_HT_SIG_VHT_SIG_A_2_OFFSET / sizeof(u32)];
++
++    preamble = ptr[RX_PPDU_START_5_PREAMBLE_TYPE_OFFSET / sizeof(u32)];
++    preamble &= RX_PPDU_START_5_PREAMBLE_TYPE_MASK;
++    preamble >>= RX_PPDU_START_5_PREAMBLE_TYPE_LSB;
++
++    switch (preamble) {
++    case PREAMBLE_LEGACY:
++        ri->nss = 0;
++        ri->bw = 0;
++        ri->sgi = 0;
++
++        ri->is_cck = ptr[RX_PPDU_START_5_L_SIG_RATE_SELECT_OFFSET / sizeof(u32)];
++        ri->is_cck &= RX_PPDU_START_5_L_SIG_RATE_SELECT_MASK;
++        ri->is_cck >>= RX_PPDU_START_5_L_SIG_RATE_SELECT_LSB;
++
++        ri->mcs = ptr[RX_PPDU_START_5_L_SIG_RATE_OFFSET / sizeof(u32)];
++        ri->mcs &= RX_PPDU_START_5_L_SIG_RATE_MASK;
++        ri->mcs >>= RX_PPDU_START_5_L_SIG_RATE_LSB;
++
++        if (ri->is_cck)
++            ri->mcs = cck2rix[ri->mcs];
++        else
++            ri->mcs = ofdm2rix[ri->mcs - 8];
++        break;
++    case PREAMBLE_HT:
++    case PREAMBLE_HT_TXBF:
++        /* HT-SIG - Table 20-11 in info2 and info3 */
++
++        ri->is_ht = 1;
++        ri->mcs = ht_sig_1 & 0x1F;
++        ri->nss = ri->mcs >> 3;
++        ri->mcs %= 8;
++        ri->bw = (ht_sig_1 >> 7) & 1;
++        ri->sgi = (ht_sig_2 >> 7) & 1;
++        ri->stbc = (ht_sig_2 >> 4) & 3;
++        break;
++    case PREAMBLE_VHT:
++    case PREAMBLE_VHT_TXBF:
++        /* VHT-SIG-A1 in info2, VHT-SIG-A2 in info3 */
++
++        ri->is_ht = 1;
++        ri->bw = ht_sig_1 & 3;
++        ri->sgi = ht_sig_2 & 1;
++        group_id = (ht_sig_1 >> 4) & 0x3F;
++
++        if (group_id == 0 || group_id == 63) {
++            ri->mcs = (ht_sig_2 >> 4) & 0x0F;
++            ri->nss = (ht_sig_1 >> 10) & 0x07;
++        } else {
++            /* Hardware doesn't decode MU-MIMO VHT-SIG-B into Rx descriptor so
++             * it's impossible to decode MCS. Also since firmware consumes
++             * Group Id Management frames host has no knowledge regarding
++             * group/user position mapping so it's impossible to pick the
++             * correct Nsts from VHT-SIG-A1.
++             *
++             * Bandwidth and SGI are valid so report the rateinfo on
++             * best-effort basis.
++             */
++            ri->mcs = 0;
++            ri->nss = 0;
++        }
++
++        /* VHT spec says STBC is only 2x1 */
++        ri->stbc = ((ht_sig_1 >> 3) & 1) ? ri->nss : 0;
++        break;
++    default:
++        memset(ri, 0, sizeof(*ri));
++        break;
++    }
++}
++
++static void *
++_ar9888_rx_desc_get_rssi(void *_rxd, int *co, int *cm, int *cs)
++{
++    struct rx_desc_base *rxd;
++    rxd = _rxd;
++    *co = RX_PPDU_START_4_RSSI_COMB_OFFSET / sizeof(u32);
++    *cm = RX_PPDU_START_4_RSSI_COMB_MASK;
++    *cs = RX_PPDU_START_4_RSSI_COMB_LSB;
++    return (void *)&rxd->ppdu_start;
++}
++
+ struct ar_rx_desc_ops ar9888_rx_desc_ops = {
+     .sizeof_rx_desc = _ar9888_rx_desc_size,
+     .offsetof_attention = _ar9888_rx_desc_offsetof_attention,
+@@ -183,6 +369,12 @@ struct ar_rx_desc_ops ar9888_rx_desc_ops
+ #if ATH_DATA_RX_INFO_EN || MESH_MODE_SUPPORT
+     .update_pkt_info = _ar9888_rx_desc_update_pkt_info,
+ #endif
++    .is_data = _ar9888_rx_desc_is_data,
++    .is_first_mpdu = _ar9888_rx_desc_is_first_mpdu,
++    .is_retry = _ar9888_rx_desc_is_retry,
++    .is_fcs_err = _ar9888_rx_desc_is_fcs_err,
++    .get_cmn_ri = _ar9888_rx_desc_get_cmn_ri,
++    .get_rssi = _ar9888_rx_desc_get_rssi,
+ };
+ 
+ struct ar_rx_desc_ops* ar9888_rx_attach(struct ar_s *ar)
+--- a/offload/hw/QCA9984/rx_desc.c
++++ b/offload/hw/QCA9984/rx_desc.c
+@@ -218,6 +218,192 @@ FN_RX_DESC_GET_SMART_ANT_STATS(qca9984)
+ FN_RX_DESC_UPDATE_PKT_INFO(qca9984)
+ #endif
+ 
++static int
++_qca9984_rx_desc_is_data(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return !(ptr[0] & (RX_ATTENTION_0_NULL_DATA_MASK |
++                       RX_ATTENTION_0_MGMT_TYPE_MASK |
++                       RX_ATTENTION_0_CTRL_TYPE_MASK));
++}
++
++static int
++_qca9984_rx_desc_is_first_mpdu(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return ptr[0] & RX_ATTENTION_0_FIRST_MPDU_MASK;
++}
++
++static int
++_qca9984_rx_desc_is_retry(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->mpdu_start;
++    return ptr[0] & RX_MPDU_START_0_RETRY_MASK;
++}
++
++static int
++_qca9984_rx_desc_is_fcs_err(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return ptr[0] & RX_ATTENTION_0_FCS_ERR_MASK;
++}
++
++static void
++_qca9984_rx_desc_get_cmn_ri(void *_rxd,
++                            struct ps_cmn_rate_info *ri)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    u32 ht_sig_1;
++    u32 ht_sig_2;
++    u32 group_id;
++    u32 preamble;
++    enum {
++        PREAMBLE_LEGACY    =  0x4,
++        PREAMBLE_HT        =  0x8,
++        PREAMBLE_HT_TXBF   =  0x9,
++        PREAMBLE_VHT       =  0xc,
++        PREAMBLE_VHT_TXBF  =  0xd,
++    };
++    enum {
++        OFDM_48M = 0,
++        OFDM_24M,
++        OFDM_12M,
++        OFDM_6M,
++        OFDM_54M,
++        OFDM_36M,
++        OFDM_18M,
++        OFDM_9M,
++    };
++    enum {
++        CCK_LONG_1M = 1,
++        CCK_LONG_2M,
++        CCK_LONG_5M,
++        CCK_LONG_11M,
++        CCK_SHORT_2M,
++        CCK_SHORT_5M,
++        CCK_SHORT_11M,
++    };
++    static const u8 ofdm2rix[8] = {
++        [OFDM_48M]  =  6,
++        [OFDM_24M]  =  4,
++        [OFDM_12M]  =  2,
++        [OFDM_6M]   =  0,
++        [OFDM_54M]  =  7,
++        [OFDM_36M]  =  5,
++        [OFDM_18M]  =  3,
++        [OFDM_9M]   =  1,
++    };
++    static const u8 cck2rix[8] = {
++        [CCK_LONG_11M]   =  3,
++        [CCK_LONG_5M]    =  2,
++        [CCK_LONG_2M]    =  1,
++        [CCK_LONG_1M]    =  0,
++        [CCK_SHORT_11M]  =  6,
++        [CCK_SHORT_5M]   =  5,
++        [CCK_SHORT_2M]   =  4,
++    };
++
++    rxd = _rxd;
++    ptr = (u32 *)&rxd->ppdu_start;
++
++    /* hw reports both vht_sig_a and ht_sig in the same spot */
++    ht_sig_1 = ptr[RX_PPDU_START_6_HT_SIG_VHT_SIG_A_1_OFFSET / sizeof(u32)];
++    ht_sig_2 = ptr[RX_PPDU_START_7_HT_SIG_VHT_SIG_A_2_OFFSET / sizeof(u32)];
++
++    preamble = ptr[RX_PPDU_START_5_PREAMBLE_TYPE_OFFSET / sizeof(u32)];
++    preamble &= RX_PPDU_START_5_PREAMBLE_TYPE_MASK;
++    preamble >>= RX_PPDU_START_5_PREAMBLE_TYPE_LSB;
++
++    switch (preamble) {
++    case PREAMBLE_LEGACY:
++        ri->nss = 0;
++        ri->bw = 0;
++        ri->sgi = 0;
++
++        ri->is_cck = ptr[RX_PPDU_START_5_L_SIG_RATE_SELECT_OFFSET / sizeof(u32)];
++        ri->is_cck &= RX_PPDU_START_5_L_SIG_RATE_SELECT_MASK;
++        ri->is_cck >>= RX_PPDU_START_5_L_SIG_RATE_SELECT_LSB;
++
++        ri->mcs = ptr[RX_PPDU_START_5_L_SIG_RATE_OFFSET / sizeof(u32)];
++        ri->mcs &= RX_PPDU_START_5_L_SIG_RATE_MASK;
++        ri->mcs >>= RX_PPDU_START_5_L_SIG_RATE_LSB;
++
++        if (ri->is_cck)
++            ri->mcs = cck2rix[ri->mcs];
++        else
++            ri->mcs = ofdm2rix[ri->mcs - 8];
++        break;
++    case PREAMBLE_HT:
++    case PREAMBLE_HT_TXBF:
++        /* HT-SIG - Table 20-11 in info2 and info3 */
++
++        ri->is_ht = 1;
++        ri->mcs = ht_sig_1 & 0x1F;
++        ri->nss = ri->mcs >> 3;
++        ri->mcs %= 8;
++        ri->bw = (ht_sig_1 >> 7) & 1;
++        ri->sgi = (ht_sig_2 >> 7) & 1;
++        ri->stbc = (ht_sig_2 >> 4) & 3;
++        break;
++    case PREAMBLE_VHT:
++    case PREAMBLE_VHT_TXBF:
++        /* VHT-SIG-A1 in info2, VHT-SIG-A2 in info3 */
++
++        ri->is_ht = 1;
++        ri->bw = ht_sig_1 & 3;
++        ri->sgi = ht_sig_2 & 1;
++        group_id = (ht_sig_1 >> 4) & 0x3F;
++
++        if (group_id == 0 || group_id == 63) {
++            ri->mcs = (ht_sig_2 >> 4) & 0x0F;
++            ri->nss = (ht_sig_1 >> 10) & 0x07;
++        } else {
++            /* Hardware doesn't decode MU-MIMO VHT-SIG-B into Rx descriptor so
++             * it's impossible to decode MCS. Also since firmware consumes
++             * Group Id Management frames host has no knowledge regarding
++             * group/user position mapping so it's impossible to pick the
++             * correct Nsts from VHT-SIG-A1.
++             *
++             * Bandwidth and SGI are valid so report the rateinfo on
++             * best-effort basis.
++             */
++            ri->mcs = 0;
++            ri->nss = 0;
++        }
++
++        /* VHT spec says STBC is only 2x1 */
++        ri->stbc = ((ht_sig_1 >> 3) & 1) ? ri->nss : 0;
++        break;
++    default:
++        memset(ri, 0, sizeof(*ri));
++        break;
++    }
++}
++
++static void *
++_qca9984_rx_desc_get_rssi(void *_rxd, int *co, int *cm, int *cs)
++{
++    struct rx_desc_base *rxd;
++    rxd = _rxd;
++    *co = RX_PPDU_START_4_RSSI_COMB_OFFSET / sizeof(u32);
++    *cm = RX_PPDU_START_4_RSSI_COMB_MASK;
++    *cs = RX_PPDU_START_4_RSSI_COMB_LSB;
++    return (void *)&rxd->ppdu_start;
++}
++
+ struct ar_rx_desc_ops qca9984_rx_desc_ops = {
+     .sizeof_rx_desc = _qca9984_rx_desc_size,
+     .offsetof_attention = _qca9984_rx_desc_offsetof_attention,
+@@ -276,6 +462,12 @@ struct ar_rx_desc_ops qca9984_rx_desc_op
+ #if ATH_DATA_RX_INFO_EN || MESH_MODE_SUPPORT
+     .update_pkt_info = _qca9984_rx_desc_update_pkt_info,
+ #endif
++    .is_data = _qca9984_rx_desc_is_data,
++    .is_first_mpdu = _qca9984_rx_desc_is_first_mpdu,
++    .is_retry = _qca9984_rx_desc_is_retry,
++    .is_fcs_err = _qca9984_rx_desc_is_fcs_err,
++    .get_cmn_ri = _qca9984_rx_desc_get_cmn_ri,
++    .get_rssi = _qca9984_rx_desc_get_rssi,
+ };
+ 
+ struct ar_rx_desc_ops* qca9984_rx_attach(struct ar_s *ar)
+--- a/offload/hw/include/ar_ops.h
++++ b/offload/hw/include/ar_ops.h
+@@ -7,6 +7,8 @@
+ #ifndef __AR_OPS_H
+ #define __AR_OPS_H
+ 
++#include <ps_uapi.h>
++
+ typedef void * rx_handle_t;
+ typedef void * ar_handle_t;
+ 
+@@ -108,6 +110,12 @@ struct ar_rx_desc_ops {
+     u_int32_t (*msdu_desc_msdu_chained)(void* rx_desc);
+     u_int32_t (*msdu_desc_tsf_timestamp)(void* rx_desc);
+     ssize_t   (*fw_rx_desc_size)(void);
++    int       (*is_data)(void *rxd);
++    int       (*is_first_mpdu)(void *rxd);
++    int       (*is_retry)(void *rxd);
++    int       (*is_fcs_err)(void *rxd);
++    void      (*get_cmn_ri)(void *rxd, struct ps_cmn_rate_info *ri);
++    void*     (*get_rssi)(void *rxd, int *co, int *cm, int *cs);
+ };
+ 
+ #define RX_DESC_ALIGN_MASK 7 /* 8-byte alignment */
+--- a/offload/hw/AR900B/rx_desc.c
++++ b/offload/hw/AR900B/rx_desc.c
+@@ -217,6 +217,192 @@ FN_RX_DESC_GET_SMART_ANT_STATS(ar900b)
+ FN_RX_DESC_UPDATE_PKT_INFO(ar900b)
+ #endif
+ 
++static int
++_ar900b_rx_desc_is_data(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return !(ptr[0] & (RX_ATTENTION_0_NULL_DATA_MASK |
++                       RX_ATTENTION_0_MGMT_TYPE_MASK |
++                       RX_ATTENTION_0_CTRL_TYPE_MASK));
++}
++
++static int
++_ar900b_rx_desc_is_first_mpdu(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return ptr[0] & RX_ATTENTION_0_FIRST_MPDU_MASK;
++}
++
++static int
++_ar900b_rx_desc_is_retry(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->mpdu_start;
++    return ptr[0] & RX_MPDU_START_0_RETRY_MASK;
++}
++
++static int
++_ar900b_rx_desc_is_fcs_err(void *_rxd)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    rxd = _rxd;
++    ptr = (void *)&rxd->attention;
++    return ptr[0] & RX_ATTENTION_0_FCS_ERR_MASK;
++}
++
++static void
++_ar900b_rx_desc_get_cmn_ri(void *_rxd,
++                            struct ps_cmn_rate_info *ri)
++{
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    u32 ht_sig_1;
++    u32 ht_sig_2;
++    u32 group_id;
++    u32 preamble;
++    enum {
++        PREAMBLE_LEGACY    =  0x4,
++        PREAMBLE_HT        =  0x8,
++        PREAMBLE_HT_TXBF   =  0x9,
++        PREAMBLE_VHT       =  0xc,
++        PREAMBLE_VHT_TXBF  =  0xd,
++    };
++    enum {
++        OFDM_48M = 0,
++        OFDM_24M,
++        OFDM_12M,
++        OFDM_6M,
++        OFDM_54M,
++        OFDM_36M,
++        OFDM_18M,
++        OFDM_9M,
++    };
++    enum {
++        CCK_LONG_1M = 1,
++        CCK_LONG_2M,
++        CCK_LONG_5M,
++        CCK_LONG_11M,
++        CCK_SHORT_2M,
++        CCK_SHORT_5M,
++        CCK_SHORT_11M,
++    };
++    static const u8 ofdm2rix[8] = {
++        [OFDM_48M]  =  6,
++        [OFDM_24M]  =  4,
++        [OFDM_12M]  =  2,
++        [OFDM_6M]   =  0,
++        [OFDM_54M]  =  7,
++        [OFDM_36M]  =  5,
++        [OFDM_18M]  =  3,
++        [OFDM_9M]   =  1,
++    };
++    static const u8 cck2rix[8] = {
++        [CCK_LONG_11M]   =  3,
++        [CCK_LONG_5M]    =  2,
++        [CCK_LONG_2M]    =  1,
++        [CCK_LONG_1M]    =  0,
++        [CCK_SHORT_11M]  =  6,
++        [CCK_SHORT_5M]   =  5,
++        [CCK_SHORT_2M]   =  4,
++    };
++
++    rxd = _rxd;
++    ptr = (u32 *)&rxd->ppdu_start;
++
++    /* hw reports both vht_sig_a and ht_sig in the same spot */
++    ht_sig_1 = ptr[RX_PPDU_START_6_HT_SIG_VHT_SIG_A_1_OFFSET / sizeof(u32)];
++    ht_sig_2 = ptr[RX_PPDU_START_7_HT_SIG_VHT_SIG_A_2_OFFSET / sizeof(u32)];
++
++    preamble = ptr[RX_PPDU_START_5_PREAMBLE_TYPE_OFFSET / sizeof(u32)];
++    preamble &= RX_PPDU_START_5_PREAMBLE_TYPE_MASK;
++    preamble >>= RX_PPDU_START_5_PREAMBLE_TYPE_LSB;
++
++    switch (preamble) {
++    case PREAMBLE_LEGACY:
++        ri->nss = 0;
++        ri->bw = 0;
++        ri->sgi = 0;
++
++        ri->is_cck = ptr[RX_PPDU_START_5_L_SIG_RATE_SELECT_OFFSET / sizeof(u32)];
++        ri->is_cck &= RX_PPDU_START_5_L_SIG_RATE_SELECT_MASK;
++        ri->is_cck >>= RX_PPDU_START_5_L_SIG_RATE_SELECT_LSB;
++
++        ri->mcs = ptr[RX_PPDU_START_5_L_SIG_RATE_OFFSET / sizeof(u32)];
++        ri->mcs &= RX_PPDU_START_5_L_SIG_RATE_MASK;
++        ri->mcs >>= RX_PPDU_START_5_L_SIG_RATE_LSB;
++
++        if (ri->is_cck)
++            ri->mcs = cck2rix[ri->mcs];
++        else
++            ri->mcs = ofdm2rix[ri->mcs - 8];
++        break;
++    case PREAMBLE_HT:
++    case PREAMBLE_HT_TXBF:
++        /* HT-SIG - Table 20-11 in info2 and info3 */
++
++        ri->is_ht = 1;
++        ri->mcs = ht_sig_1 & 0x1F;
++        ri->nss = ri->mcs >> 3;
++        ri->mcs %= 8;
++        ri->bw = (ht_sig_1 >> 7) & 1;
++        ri->sgi = (ht_sig_2 >> 7) & 1;
++        ri->stbc = (ht_sig_2 >> 4) & 3;
++        break;
++    case PREAMBLE_VHT:
++    case PREAMBLE_VHT_TXBF:
++        /* VHT-SIG-A1 in info2, VHT-SIG-A2 in info3 */
++
++        ri->is_ht = 1;
++        ri->bw = ht_sig_1 & 3;
++        ri->sgi = ht_sig_2 & 1;
++        group_id = (ht_sig_1 >> 4) & 0x3F;
++
++        if (group_id == 0 || group_id == 63) {
++            ri->mcs = (ht_sig_2 >> 4) & 0x0F;
++            ri->nss = (ht_sig_1 >> 10) & 0x07;
++        } else {
++            /* Hardware doesn't decode MU-MIMO VHT-SIG-B into Rx descriptor so
++             * it's impossible to decode MCS. Also since firmware consumes
++             * Group Id Management frames host has no knowledge regarding
++             * group/user position mapping so it's impossible to pick the
++             * correct Nsts from VHT-SIG-A1.
++             *
++             * Bandwidth and SGI are valid so report the rateinfo on
++             * best-effort basis.
++             */
++            ri->mcs = 0;
++            ri->nss = 0;
++        }
++
++        /* VHT spec says STBC is only 2x1 */
++        ri->stbc = ((ht_sig_1 >> 3) & 1) ? ri->nss : 0;
++        break;
++    default:
++        memset(ri, 0, sizeof(*ri));
++        break;
++    }
++}
++
++static void *
++_ar900b_rx_desc_get_rssi(void *_rxd, int *co, int *cm, int *cs)
++{
++    struct rx_desc_base *rxd;
++    rxd = _rxd;
++    *co = RX_PPDU_START_4_RSSI_COMB_OFFSET / sizeof(u32);
++    *cm = RX_PPDU_START_4_RSSI_COMB_MASK;
++    *cs = RX_PPDU_START_4_RSSI_COMB_LSB;
++    return (void *)&rxd->ppdu_start;
++}
++
+ struct ar_rx_desc_ops ar900b_rx_desc_ops = {
+     .sizeof_rx_desc = _ar900b_rx_desc_size,
+     .offsetof_attention = _ar900b_rx_desc_offsetof_attention,
+@@ -275,6 +461,12 @@ struct ar_rx_desc_ops ar900b_rx_desc_ops
+ #if ATH_DATA_RX_INFO_EN || MESH_MODE_SUPPORT
+     .update_pkt_info = _ar900b_rx_desc_update_pkt_info,
+ #endif
++    .is_data = _ar900b_rx_desc_is_data,
++    .is_first_mpdu = _ar900b_rx_desc_is_first_mpdu,
++    .is_retry = _ar900b_rx_desc_is_retry,
++    .is_fcs_err = _ar900b_rx_desc_is_fcs_err,
++    .get_cmn_ri = _ar900b_rx_desc_get_cmn_ri,
++    .get_rssi = _ar900b_rx_desc_get_rssi,
+ };
+ 
+ struct ar_rx_desc_ops* ar900b_rx_attach(struct ar_s *ar)

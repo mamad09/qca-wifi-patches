@@ -1,0 +1,53 @@
+Janusz discovered IEEE80211_EV_* were not aligned
+between WM and driver. He was seeing
+IEEE80211_EV_RADAR_DETECT as 37 and 41
+respectively.
+
+Turns out qcawifi-10.4 no longer exposed build
+defines in ieee80211_external.h. Instead it
+exports these in additional file
+ieee80211_external_config.h.
+
+The lack of build define inclusion was affecting
+WM, SM as well as wpa_supplicant and hostapd, at
+least on Piranha. Applying this on all branches
+and different git repos would be a pain.
+
+Due to the fact build defines often change binary
+layout of structures in memory (sizes, offsets)
+there may have been bugs hidden that haven't
+surfaced yet.
+
+On Piranha, Caesar and Cell WM1 radar event
+reports were affected for sure. wpa_supplicant
+wouldn't process
+IEEE80211_EV_UNPROTECTED_DEAUTH_IND_STA properly
+(related to 11w/pmf, but "fortunately" not a big
+deal because we're not using it). I don't know how
+much SM suffered. I would expect regular
+client/vap/radio stats could've been silently
+broken. Same goes for hostapd - didn't investigate
+much beyond being worried it does rely on some
+internal driver structures (e.g.
+ieee80211_channel which fortunately isn't
+ifdef-ed).
+
+Other platforms might still be affected
+implicitly at their middle layer (e.g.
+wifihal @ XB3, MV1). They might require this fix
+too.
+
+Including the missing file into the
+ieee80211_external.h guarantees all existing
+userspace apps that expect it to be enough will
+be fixed.
+--- a/os/linux/include/ieee80211_external.h
++++ b/os/linux/include/ieee80211_external.h
+@@ -44,6 +44,7 @@
+ #include "os/linux/include/ath_ald_external.h"
+ #include "os/linux/include/ieee80211_ev.h"
+ #else
++#include "ieee80211_external_config.h"
+ #include "ieee80211.h"
+ #include "ieee80211_defines.h"
+ #include "ieee80211_ioctl.h"

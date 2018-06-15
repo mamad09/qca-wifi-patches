@@ -1,0 +1,98 @@
+--- a/offload/wlan/lmac_offload_if/ol_if_vap.c
++++ b/offload/wlan/lmac_offload_if/ol_if_vap.c
+@@ -171,7 +171,7 @@ static const int ht20_11n_rate_ol[][2] =
+     {260000, 0xb7},
+ };
+ 
+-static const int ht20_11ac_rate_ol[][2] = {
++static const int ht20_11ac_1nss_rate_ol[][2] = {
+ /* VHT MCS0-9 NSS 1 20 MHz */
+     { 6500, 0xc0},
+     {13000, 0xc1},
+@@ -183,7 +183,9 @@ static const int ht20_11ac_rate_ol[][2]
+     {65000, 0xc7},
+     {78000, 0xc8},
+     {86500, 0xc9},
++};
+ 
++static const int ht20_11ac_2nss_rate_ol[][2] = {
+ /* VHT MCS0-9 NSS 2 20 MHz */
+     { 13000, 0xd0},
+     { 26000, 0xd1},
+@@ -444,7 +446,7 @@ ol_ath_vdev_atf_request_send(struct ol_a
+ }
+ #endif
+ 
+-int ol_get_rate_code(struct ieee80211_channel *chan, int val)
++int ol_get_rate_code(struct ieee80211vap *vap, struct ieee80211_channel *chan, int val)
+ {
+     uint32_t chan_mode;
+     int i = 0, j = 0, found = 0, array_size = 0;
+@@ -497,11 +499,18 @@ int ol_get_rate_code(struct ieee80211_ch
+         case IEEE80211_MODE_11AC_VHT80:
+         case IEEE80211_MODE_11AC_VHT160:
+         case IEEE80211_MODE_11AC_VHT80_80:
+-            {
+-                rate_table[0].size = sizeof(ht20_11ac_rate_ol)/sizeof(ht20_11ac_rate_ol[0]);
+-                rate_table[0].table = (int *)&ht20_11ac_rate_ol;
++            if (vap->iv_nss != 1) {
++                rate_table[2].size = sizeof(ht20_11ac_2nss_rate_ol)/sizeof(ht20_11ac_2nss_rate_ol[0]);
++                rate_table[2].table = (int *)&ht20_11ac_2nss_rate_ol;
++                rate_table[1].size = sizeof(ht20_11ac_1nss_rate_ol)/sizeof(ht20_11ac_1nss_rate_ol[0]);
++                rate_table[1].table = (int *)&ht20_11ac_1nss_rate_ol;
++            } else {
++                rate_table[2].size = sizeof(ht20_11ac_1nss_rate_ol)/sizeof(ht20_11ac_1nss_rate_ol[0]);
++                rate_table[2].table = (int *)&ht20_11ac_1nss_rate_ol;
++                rate_table[1].size = sizeof(ht20_11ac_2nss_rate_ol)/sizeof(ht20_11ac_2nss_rate_ol[0]);
++                rate_table[1].table = (int *)&ht20_11ac_2nss_rate_ol;
+             }
+-
++            break;
+         case IEEE80211_MODE_11NG_HT20:
+         case IEEE80211_MODE_11NG_HT40:
+         case IEEE80211_MODE_11NG_HT40PLUS:
+@@ -880,7 +889,7 @@ ol_ath_vap_set_param(struct ieee80211vap
+                 break;
+             }
+ 
+-            value = ol_get_rate_code(chan, val);
++            value = ol_get_rate_code(vap, chan, val);
+             if(value == EINVAL) {
+                 retval = -EINVAL;
+                 break;
+@@ -910,7 +919,7 @@ ol_ath_vap_set_param(struct ieee80211vap
+                 break;
+             }
+ 
+-            value = ol_get_rate_code(chan, val);
++            value = ol_get_rate_code(vap, chan, val);
+             if(value == EINVAL) {
+                 retval = -EINVAL;
+                 break;
+@@ -944,7 +953,7 @@ ol_ath_vap_set_param(struct ieee80211vap
+                 retval = EINVAL;
+                 break;
+             }
+-            value = ol_get_rate_code(chan, val);
++            value = ol_get_rate_code(vap, chan, val);
+             if(value == EINVAL) {
+                 retval = EINVAL;
+                 break;
+@@ -973,7 +982,7 @@ ol_ath_vap_set_param(struct ieee80211vap
+                 retval = EINVAL;
+                 break;
+             }
+-            rtscts_rate = ol_get_rate_code(chan, val);
++            rtscts_rate = ol_get_rate_code(vap, chan, val);
+             if(rtscts_rate == EINVAL) {
+                retval = EINVAL;
+                 break;
+@@ -995,7 +1004,7 @@ ol_ath_vap_set_param(struct ieee80211vap
+                 break;
+             }
+ 
+-            beacon_rate = ol_get_rate_code(chan, val);
++            beacon_rate = ol_get_rate_code(vap, chan, val);
+             if(beacon_rate == EINVAL) {
+                 retval = EINVAL;
+                 break;

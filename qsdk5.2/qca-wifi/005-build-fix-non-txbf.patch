@@ -1,0 +1,81 @@
+compiling without txbf was not possible due to missing symbol errors
+add missing #ifdef protection for txbf specific code chunks
+
+--- a/lmac/ratectrl/ratectrl11n.h
++++ b/lmac/ratectrl/ratectrl11n.h
+@@ -135,10 +135,13 @@ typedef enum {
+ 
+ #define SWAP_RATE           0xf
+ #define SWAP_TABLE_SIZE     SWAP_RATE+1 
++
++#ifdef ATH_SUPPORT_TxBF
+ extern const u_int8_t sounding_swap_table_A_40[SWAP_TABLE_SIZE];
+ extern const u_int8_t sounding_swap_table_A_20[SWAP_TABLE_SIZE];
+ extern const u_int8_t sounding_swap_table_G_40[SWAP_TABLE_SIZE];
+ extern const u_int8_t sounding_swap_table_G_20[SWAP_TABLE_SIZE];
++#endif
+                                                     
+ /* valid rate defines*/
+ #define VALID_RATE_NoTxBF(_pRateTable,_pSib,_rate)  \
+--- a/lmac/ath_dev/ath_edma_recv.c
++++ b/lmac/ath_dev/ath_edma_recv.c
+@@ -1823,9 +1823,11 @@ wbuf_t ath_rx_edma_buf_merge(struct ath_
+ 		wbuf_pull(wbuf, sc->sc_rxstatuslen);
+ 		wbuf_copydata(wbuf, 0, wbuf_get_pktlen(wbuf), wbuf_header(databuf)+datalen);
+ 		datalen += rxs->rs_datalen;
++#ifdef ATH_SUPPORT_TxBF
+ 		if (rxs->rx_hw_upload_data)
+ 			rxs->rs_datalen = datalen;
+ 		else
++#endif
+ 			rxs->rs_datalen = (datalen-sc->sc_rxstatuslen);
+ 	}
+ 	return databuf;
+--- a/lmac/ath_dev/ath_main.c
++++ b/lmac/ath_dev/ath_main.c
+@@ -8843,10 +8843,10 @@ ath_dev_free(ath_dev_t dev)
+         ath_cancel_timer(&sc->sc_selfgen_timer, CANCEL_NO_SLEEP);
+         ath_free_timer(&sc->sc_selfgen_timer);
+     }
++#endif  // for TxBF RC
+     ath_cancel_timer(&sc->sc_chan_busy, CANCEL_NO_SLEEP);
+     ath_free_timer(&sc->sc_chan_busy);
+ 
+-#endif  // for TxBF RC
+ #if ATH_GEN_RANDOMNESS
+     ath_rng_stop(sc);
+ #endif
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -5251,7 +5251,9 @@ ieee80211_add_tx_radiotap_header(struct
+         *pos++ = 0;
+     }
+     /* TSF bit0 */
++#ifdef ATH_SUPPORT_TxBF
+     put_unaligned_le64(ts->tstamp, pos);
++#endif
+     rthdr->it_present |= cpu_to_le32(BIT(IEEE80211_RADIOTAP_TSFT));
+     pos += 8;
+ 
+--- a/lmac/ath_dev/ath_aponly.c
++++ b/lmac/ath_dev/ath_aponly.c
+@@ -430,7 +430,9 @@ _ath_tx_free_buf(struct ath_softc *sc, s
+ {
+     ieee80211_tx_status_t tx_status;
+     tx_status.flags = 0;
++#ifdef ATH_SUPPORT_TxBF
+     tx_status.tstamp = 0;
++#endif
+     tx_status.retries = 0;
+     tx_status.rateKbps = 0;
+     
+@@ -438,7 +440,9 @@ _ath_tx_free_buf(struct ath_softc *sc, s
+         tx_status.flags |= ATH_TX_ERROR;
+ 
+     if (ts != NULL) {
++#ifdef ATH_SUPPORT_TxBF
+         tx_status.tstamp = ts->ts_tstamp;
++#endif
+         tx_status.retries = ts->ts_shortretry + ts->ts_longretry;
+         tx_status.rateKbps = ath_ratecode_to_ratekbps(sc, ts->ts_ratecode);
+     }

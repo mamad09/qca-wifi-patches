@@ -1,0 +1,399 @@
+Apparently "combined RSSI" is not what the name
+suggests it is. From my tests it looks like it's
+merely chain0 (Dragonfly) or chain0pri20
+(Peregrine) RSSI copied over.
+
+I've observed even up to 8dB difference for 2x2
+VHT80.
+
+The fixup is disabled by default with the
+intention of reducing impact on stock driver
+setup.
+
+The knob takes a mask of:
+ 0x1 - enable tx ack rssi fixup
+ 0x2 - enable rx rssi fixup
+
+To enable both these need to be ORed: 0x3.
+
+The confiugration knob is exposed as per-vap but
+in reality it is per-radio. This is done for code
+simplicity reasons.
+
+This change focuses on fixing internal rssi
+accounting. Some userspace visible values will
+still be skewed.
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -3899,6 +3899,7 @@ struct ath_ops {
+     int         (*get_therm)(ath_dev_t dev, int *therm);
+     int         (*mac_to_clks)(ath_dev_t dev, int usec);
+     unsigned long (*poll_q_util)(ath_dev_t dev);
++    void        (*rssi_comb_fix_set)(ath_dev_t dev, int enable);
+ 
+ };
+ 
+--- a/offload/wlan/lmac_offload_if/ol_if_stats.c
++++ b/offload/wlan/lmac_offload_if/ol_if_stats.c
+@@ -1735,6 +1735,16 @@ process_tx_stats(struct ol_txrx_pdev_t *
+ 
+         txrx_pdev->tx_stats.ave_rssi = *((u_int32_t *)tx_ppdu_status_desc + 16 + 11) & 0xff;
+ 
++        if (ic->ic_rssi_comb_fix & (1 << IEEE80211_RATE_TX)) {
++            if (txrx_pdev->tx_stats.no_ack ||
++                !((*((u_int32_t *)tx_ppdu_status_desc + TX_OK_OFFSET)) & TX_OK_MASK))
++                txrx_pdev->tx_stats.ave_rssi = 0x80;
++            else 
++                txrx_pdev->tx_stats.ave_rssi = sum_signal_db(
++                        (unsigned char *)(tx_ppdu_status_desc + (4*16) + (4*7)),
++                        4 * ic->ic_num_rx_chain);
++        }
++
+         /* If no_ack, no way to know if tx has error so ignore. If !tx_ok, incr tx_error.  */
+         /* TODO: Define ole_stats and ole_desc strcut and get stats from ole_stats.*/
+         if ( !txrx_pdev->tx_stats.no_ack &&
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1495,6 +1495,7 @@ enum {
+     IEEE80211_PARAM_SCAN_FILTER,
+     IEEE80211_PARAM_SCAN_FILTER_SSID,
+     IEEE80211_PARAM_VERSIONING,
++    IEEE80211_PARAM_RSSI_COMBINED_FIX,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14572,6 +14572,8 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_SCAN_FILTER_SSID, 0,
+       IW_PRIV_TYPE_CHAR | 33,    "gscanfilterssid" },
+     { IEEE80211_PARAM_VERSIONING, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "versioning" },
++    { IEEE80211_PARAM_RSSI_COMBINED_FIX, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "srssicombfix" },
++    { IEEE80211_PARAM_RSSI_COMBINED_FIX, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "grssicombfix" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -9139,6 +9139,15 @@ ath_net80211_cc_clk_khz(struct ieee80211
+     return khz;
+ }
+ 
++static void
++ath_net80211_rssi_comb_fix_set(struct ieee80211com *ic, int enable)
++{
++    struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
++
++    if (scn->sc_ops->rssi_comb_fix_set)
++        scn->sc_ops->rssi_comb_fix_set(scn->sc_dev, enable);
++}
++
+ #if ATH_BAND_STEERING
+ static bool
+ ath_net80211_bs_set_params(struct ieee80211com *ic,
+@@ -9703,6 +9712,7 @@ ath_attach(u_int16_t devid, void *base_a
+     ic->ic_is_macreq_enabled = ath_net80211_is_macreq_enabled;
+     ic->ic_get_mac_prealloc_idmask = ath_net80211_get_mac_prealloc_idmask;
+     ic->ic_cc_clk_khz = ath_net80211_cc_clk_khz;
++    ic->ic_rssi_comb_fix_set = ath_net80211_rssi_comb_fix_set;
+ 
+     /* Attach the direct attach print scan function */
+     ic->ic_print_scan_config = wlan_print_scan_config;
+--- a/hal/ah.h
++++ b/hal/ah.h
+@@ -2646,6 +2646,8 @@ struct ath_hal {
+     unsigned long   ah_bt_coex_wl_weight;
+ #endif
+     struct smart_ant_gpio_conf sa_gpio_conf;
++    u_int32_t   ah_rssi_comb_fix_rx:1;
++    u_int32_t   ah_rssi_comb_fix_tx:1;
+ };
+ 
+ /* 
+--- a/hal/ar9300/ar9300_recv_ds.c
++++ b/hal/ar9300/ar9300_recv_ds.c
+@@ -25,6 +25,31 @@
+ #endif /* ATH_SUPPORT_WIRESHARK */
+ 
+ 
++static void
++ar9300_recv_fix_rssi(struct ath_hal *ah,
++                     struct ath_rx_status *rs)
++{
++    unsigned char rssi;
++
++    if (!ah->ah_rssi_comb_fix_rx)
++        return;
++
++    if (rs->rs_rssi & 0x80)
++        return;
++
++    if (rs->rs_status != 0)
++        return;
++
++    if (rs->rs_isaggr && rs->rs_moreaggr)
++        return;
++
++    rssi = sum_signal_db((unsigned char *)&rs->rs_rssi_ctl0, 6);
++    if (rssi <= rs->rs_rssi)
++        return;
++
++    rs->rs_rssi = rssi;
++}
++
+ /*
+  * Process an RX descriptor, and return the status to the caller.
+  * Copy some hardware specific items into the software portion
+@@ -214,6 +239,7 @@ ar9300_proc_rx_desc_fast(struct ath_hal
+ #endif
+     }
+ #endif
++    ar9300_recv_fix_rssi(ah, rxs);
+     rxs->rs_channel = AH_PRIVATE(ah)->ah_curchan->channel;
+     return HAL_OK;
+ }
+--- a/hal/ar9300/ar9300_xmit_ds.c
++++ b/hal/ar9300/ar9300_xmit_ds.c
+@@ -233,6 +233,28 @@ ar9300_get_raw_tx_desc(struct ath_hal *a
+     OS_MEMCPY(txstatus, ads, sizeof(struct ar9300_txs));
+ }
+ 
++static void
++ar9300_xmit_fix_rssi(struct ath_hal *ah,
++                     struct ath_tx_status *ts)
++{
++    unsigned char rssi;
++
++    if (!ah->ah_rssi_comb_fix_tx)
++       return;
++   
++    if (ts->ts_status != 0)
++        return;
++
++    if (ts->ts_rssi & 0x80)
++        return;
++
++    rssi = sum_signal_db((unsigned char *)&ts->ts_rssi_ctl0, 6);
++    if (rssi <= ts->ts_rssi)
++        return;
++
++    ts->ts_rssi = rssi;
++}
++
+ /*
+  * Processing of HW TX descriptor.
+  */
+@@ -372,6 +394,7 @@ ar9300_proc_tx_desc(struct ath_hal *ah,
+ #endif
+     /* extract TID from block ack */
+     ts->tid = MS(ads->status8, AR_tx_tid);
++    ar9300_xmit_fix_rssi(ah, ts);
+ 
+     /* Zero out the status for reuse */
+     OS_MEMZERO(ads, sizeof(struct ar9300_txs));
+--- a/lmac/ath_dev/ath_main.c
++++ b/lmac/ath_dev/ath_main.c
+@@ -7009,6 +7009,16 @@ ath_poll_q_util(ath_dev_t dev)
+     return mask;
+ }
+ 
++static void
++ath_rssi_comb_fix_set(ath_dev_t dev, int enable)
++{
++    struct ath_softc *sc = ATH_DEV_TO_SC(dev);
++    struct ath_hal *ah = sc->sc_ah;
++
++    ah->ah_rssi_comb_fix_tx = !!(enable & (1 << IEEE80211_RATE_TX));
++    ah->ah_rssi_comb_fix_rx = !!(enable & (1 << IEEE80211_RATE_RX));
++}
++
+ /*
+  * Callback table for Atheros ARXXXX MACs
+  */
+@@ -7532,6 +7542,7 @@ static const struct ath_ops ath_ar_ops =
+     .get_therm = ath_get_therm,
+     .mac_to_clks = ath_mac_to_clks,
+     .poll_q_util = ath_poll_q_util,
++    .rssi_comb_fix_set = ath_rssi_comb_fix_set,
+ };
+ 
+ int init_sc_params(struct ath_softc *sc,struct ath_hal *ah)
+--- a/offload/wlan/txrx/ol_rx.c
++++ b/offload/wlan/txrx/ol_rx.c
+@@ -573,6 +573,56 @@ ol_ps_kapi_inc_rx_stats(struct ieee80211
+     stats->stats[rix].num_mpdus++;
+ }
+ 
++static void
++ol_rx_fix_rssi(
++    struct ieee80211com *ic,
++    qdf_nbuf_t msdu)
++{
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_txrx_pdev_t *pdev;
++    struct htt_pdev_t *htt_pdev;
++    struct ar_rx_desc_ops *ar_rx_ops;
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    u8 old;
++    u8 new;
++    int co;
++    int cm;
++    int cs;
++
++    if (!(ic->ic_rssi_comb_fix & (1 << IEEE80211_RATE_RX)))
++        return;
++
++    if (msdu == NULL)
++        return;
++
++    scn = OL_ATH_SOFTC_NET80211(ic);
++    pdev = scn->pdev_txrx_handle;
++    htt_pdev = pdev->htt_pdev;
++    ar_rx_ops = htt_pdev->ar_rx_ops;
++
++    if (unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_first_mpdu))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->get_rssi))))
++        return;
++
++    rxd = htt_rx_desc(msdu);
++
++    if (!ar_rx_ops->is_first_mpdu(rxd))
++        return;
++
++    ptr = ar_rx_ops->get_rssi(rxd, &co, &cm, &cs);
++    old = (ptr[co] & cm) >> cs;
++    if (old & 0x80)
++        return;
++
++    new = sum_signal_db((unsigned char *)ptr, 4 * ic->ic_num_rx_chain);
++    if (new <= old)
++        new = old;
++
++    ptr[co] &= ~cm;
++    ptr[co] |= new << cs;
++}
++
+ void
+ ol_rx_indication_handler(
+     ol_txrx_pdev_handle pdev,
+@@ -727,6 +777,7 @@ ol_rx_indication_handler(
+ #endif
+                     rx_ind_msg, &head_msdu, &tail_msdu, &npackets);
+ 
++                ol_rx_fix_rssi(ic, npackets ? head_msdu : 0);
+                 ps_kapi_inc_rx_duration(ic,
+                                         ni,
+                                         head_msdu,
+@@ -951,6 +1002,7 @@ ol_rx_indication_handler(
+ #endif
+                         rx_ind_msg, &msdu, &tail_msdu, &npackets);
+ 
++                ol_rx_fix_rssi(ic, npackets ? msdu : 0);
+                 ps_kapi_inc_rx_duration(ic,
+                                         ni,
+                                         msdu,
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -1899,6 +1899,8 @@ int (*ic_print_scan_config)(wlan_if_t va
+     int                                 ps_kapi_rix;
+     int                                 ps_kapi_sgi;
+     int                                 ps_kapi_first_mpdu;
++    int                                 ic_rssi_comb_fix;
++    void                                (*ic_rssi_comb_fix_set)(struct ieee80211com *ic, int enable);
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2153,6 +2153,11 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+             retv = 0;
+         }
+         break;
++    case IEEE80211_PARAM_RSSI_COMBINED_FIX:
++        ic->ic_rssi_comb_fix = value;
++        if (ic->ic_rssi_comb_fix_set)
++            ic->ic_rssi_comb_fix_set(ic, value);
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+@@ -4512,6 +4517,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+         }
+         break;
+     }
++    case IEEE80211_PARAM_RSSI_COMBINED_FIX:
++        *value = ic->ic_rssi_comb_fix;
++        break;
+     case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
+         *value = ic->ic_poll_q_util_interval_ms;
+         break;
+--- a/asf/include/asf_amem.h
++++ b/asf/include/asf_amem.h
+@@ -557,4 +557,66 @@ int asf_amem_leak_lim_new_pct_private(
+     asf_amem_instance_handle inst, int val);
+ #endif
+ 
++/* Placement of this function is an attempt to
++ * have this function available for
++ * inlining for both DA and OL radios without duplicating it.
++ */
++
++static inline unsigned char
++sum_signal_db(unsigned char *rssi, int num)
++{
++    /* This saves doing some expensive computations one would normally need to
++     * go through to do decibel arithmetics. The precision is good enough.
++     * Roughly 25% samples are rounded up too much and exceed the hardware's
++     * combined signal by 1.
++     *
++     * The db_map is 6 left bitshifted map that maps input decibel difference
++     * to output decibel difference. E.g.
++     *
++     *  a = 10db
++     *  b = 12db
++     *  d = max(a, b) - min(a, b) = 12 - 10 = 2
++     *  map[d] = ((a + b) - max(a, b)) * (2**6) = (14.1 - 12) * 64 = 2.1 * 64 = 134.4
++     *  map[2] = 134
++     *
++     * QED
++     */
++    static const unsigned char db_map[] = { 192, 160, 134, 115, 96, 76, 64, 51, 38, 32, 25, 19, 19, 12, 12, 6 };
++    unsigned short rssi_ave;
++    int i;
++    int max_i = -1;
++    int delta;
++
++    for (i = 0; i < num; i++) {
++        if (rssi[i] & 0x80)
++            continue;
++
++        if (max_i == -1 || rssi[max_i] < rssi[i])
++            max_i = i;
++    }
++
++    if (max_i == -1)
++        return 0x80;
++
++    rssi_ave = rssi[max_i];
++    rssi_ave <<= 6;
++
++    for (i = 0; i < num; i++) {
++        if (i == max_i)
++            continue;
++
++        if (rssi[i] & 0x80)
++            continue;
++
++        delta = (rssi_ave >> 6) - rssi[i];
++        if (delta >= ARRAY_SIZE(db_map))
++            continue;
++
++        rssi_ave += db_map[delta];
++    }
++
++    rssi_ave >>= 6;
++    return rssi_ave;
++}
++
+ #endif /* ASF_AMEM_H */

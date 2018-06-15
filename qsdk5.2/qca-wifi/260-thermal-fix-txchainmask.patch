@@ -1,0 +1,222 @@
+Our pods (Piranha and Caesar) have limited thermal
+capacity.
+
+Reducing number of tx chains seems to reduce power
+draw by 20% (~5W -> ~4W) on Piranha.
+
+The idea is to use txchainmask (DA chips) and
+txchainsoft (OL chips) for thermal throttling when
+temperature threshold is reached to avoid
+overheating and possibly burning the user if
+touched or thermal shutdown.
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -8632,6 +8632,28 @@ ath_net80211_set_macaddr(struct ieee8021
+     return 0;
+ }
+ 
++static void
++ath_update_sta_rc_iter_sta(
++        void *arg,
++        struct ieee80211_node *ni)
++{
++    struct ieee80211com *ic;
++
++    ic = ni->ni_ic;
++    ic->ic_rate_node_update(ic, ni, 1);
++}
++
++static void
++ath_update_sta_rc_iter_vap(
++        void *arg,
++        wlan_if_t vap)
++{
++    wlan_iterate_station_list(
++            vap,
++            ath_update_sta_rc_iter_sta,
++            NULL);
++}
++
+ static int
+ ath_net80211_set_chain_mask(struct ieee80211com *ic, ieee80211_device_param type, u_int32_t mask)
+ {
+@@ -8663,6 +8685,7 @@ ath_net80211_set_chain_mask(struct ieee8
+     default:
+         break;
+     }
++    wlan_iterate_vap_list(ic, ath_update_sta_rc_iter_vap, NULL);
+     return 0;
+ }
+ 
+--- a/lmac/ath_dev/ath_main.c
++++ b/lmac/ath_dev/ath_main.c
+@@ -11278,6 +11278,13 @@ void ath_set_rx_chainmask(ath_dev_t dev,
+ void ath_set_tx_chainmask(ath_dev_t dev, u_int8_t mask)
+ {
+     struct ath_softc *sc = ATH_DEV_TO_SC(dev);
++    unsigned int hwmask;
++
++    hwmask = 1;
++    (void)ath_hal_gettxchainmask(sc->sc_ah, &hwmask);
++    mask &= hwmask;
++    if (mask == 0)
++        mask = hwmask;
+ 
+     sc->sc_config.txchainmask = sc->sc_tx_chainmask = mask;
+     sc->sc_tx_numchains = sc->sc_mask2chains[sc->sc_tx_chainmask];
+--- a/lmac/ath_dev/ath_config.c
++++ b/lmac/ath_dev/ath_config.c
+@@ -51,6 +51,14 @@ ath_set_config(ath_dev_t dev, ath_param_
+     switch(ID)
+     {
+         case ATH_PARAM_TXCHAINMASK:
++             ic->ic_set_chain_mask(
++                     ic,
++                     IEEE80211_DEVICE_TX_CHAIN_MASK,
++                     (1 << ((u_int32_t *)buff)[0]) - 1);
++             /* This break is intended to prevent (original) code from
++              * executing since it doesn't do it's job really well.
++              */
++             break;
+              (void) ath_hal_gettxchainmask(sc->sc_ah, &hal_chainmask);
+              if (!*(u_int32_t *)buff) {
+                  sc->sc_config.txchainmask = hal_chainmask;
+--- a/offload/wlan/lmac_offload_if/ol_if_ath_config.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath_config.c
+@@ -100,6 +100,127 @@ int config_rxchainmask(struct ieee80211c
+ 
+     return 0;
+ }
++
++static void
++ol_ath_set_config_param_txchainsoft_fixup_iter_vap(
++        void *arg,
++        struct ieee80211vap *vap)
++{
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_ath_vap_net80211 *avn;
++    int *nss;
++    int err;
++
++    avn = OL_ATH_VAP_NET80211(vap);
++    scn = avn->av_sc;
++    nss = arg;
++
++    err = ol_ath_wmi_send_vdev_param(
++            scn,
++            avn->av_if_id,
++            wmi_vdev_param_nss,
++            *nss);
++    if (err) {
++        printk("%s: failed to set vdev(%s) nss(%d): %d\n",
++                __func__,
++                vap->iv_netdev_name,
++                *nss,
++                err);
++        return;
++    }
++
++    vap->iv_nss = *nss;
++}
++
++static int
++ol_ath_set_config_param_txchainsoft_fixup_required(
++        struct ol_ath_softc_net80211 *scn)
++{
++    /* Some chip firmware blobs don't support txchainsoft
++     * parameter and need a different way of adjusting
++     * txchainmask on the fly (without re-associating
++     * clients).
++     *
++     * Currently only Peregrine is known to require this
++     * workaround.
++     *
++     * Moreover Cascade is confirmed to crash if this code
++     * is attempted to be executed (it asserts somewhere
++     * upon subsequent htt-tx command).
++     */
++    switch (scn->target_type) {
++        case TARGET_TYPE_AR9888:
++        case TARGET_TYPE_AR9888V2:
++            return 1;
++        case TARGET_TYPE_AR6001:
++        case TARGET_TYPE_AR6002:
++        case TARGET_TYPE_AR6003:
++        case TARGET_TYPE_AR6004:
++        case TARGET_TYPE_AR6006:
++        case TARGET_TYPE_AR6320:
++        case TARGET_TYPE_AR900B:
++        case TARGET_TYPE_QCA9984:
++        case TARGET_TYPE_IPQ4019:
++        case TARGET_TYPE_QCA9888:
++        case TARGET_TYPE_AR6320V1:
++        case TARGET_TYPE_AR6320V2:
++        case TARGET_TYPE_AR6320V3:
++        case TARGET_TYPE_QCA9377V1:
++        case TARGET_TYPE_ADRASTEA:
++            return 0;
++    }
++
++    printk("%s: unhandled target_type = %d\n", __func__, scn->target_type);
++    return 0;
++}
++
++static void
++ol_ath_set_config_param_txchainsoft_fixup(
++        struct ol_ath_softc_net80211 *scn,
++        int value)
++{
++    struct ieee80211com *ic;
++    int err;
++    int nss;
++
++    if (!ol_ath_set_config_param_txchainsoft_fixup_required(scn))
++        return;
++
++    ic = &scn->sc_ic;
++
++    value &= scn->wlan_resource_config.tx_chain_mask;
++    if (value == 0)
++        value = scn->wlan_resource_config.tx_chain_mask;
++
++    err = ol_ath_pdev_set_param(
++            scn,
++            wmi_pdev_param_tx_chain_mask,
++            value,
++            0);
++    if (err) {
++        printk("%s: failed to set txchainmask(%08x): %d\n",
++                __func__,
++                value,
++                err);
++        return;
++    }
++
++    /* This updates RC module to prevent it from
++     * attempting using rates with NSS that is
++     * beyond configured txchainmask.
++     *
++     * This isn't strictly necessary and works on
++     * best-effort basis. Newly created interfaces
++     * won't inherit this until txchainmask is
++     * configured again.
++     */
++    nss = hweight32(value);
++    wlan_iterate_vap_list(
++            ic,
++            ol_ath_set_config_param_txchainsoft_fixup_iter_vap,
++            &nss);
++}
++
+ #define MAX_ANTENNA_GAIN 30
+ int
+ ol_ath_set_config_param(struct ol_ath_softc_net80211 *scn,
+@@ -1713,6 +1834,8 @@ low_power_config:
+                 QDF_PRINT_INFO(ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "ERROR - soft chainmask value 0x%x couldn't be set\n", value);
+             else
+                 scn->soft_chain = value;
++
++            ol_ath_set_config_param_txchainsoft_fixup(scn, scn->soft_chain);
+         }
+         break;
+ 

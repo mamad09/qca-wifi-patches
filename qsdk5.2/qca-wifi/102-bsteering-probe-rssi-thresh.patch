@@ -1,0 +1,89 @@
+--- a/umac/band_steering/band_steering.c
++++ b/umac/band_steering/band_steering.c
+@@ -632,7 +632,8 @@ int wlan_bsteering_enable_events(struct
+  * @param [in] vap  the VAP for which to change the value
+  * @param [in] req  request from user space containing the station MAC
+  *                  address and whether to enable or disable probe
+- *                  response withholding
++ *                  response withholding.  If non-zero, the value is
++ *                  used as an RSSI threshold.
+  *
+  * @return EINVAL if the request is malformed; ENOENT if the MAC is not
+  *         currently in the ACL; otherwise EOK
+@@ -646,8 +647,11 @@ int wlan_bsteering_set_probe_resp_wh(str
+     }
+ 
+     if (req->data.bsteering_probe_resp_wh) {
+-        return ieee80211_acl_set_flag(vap, req->dstmac,
+-                                      IEEE80211_ACL_FLAG_PROBE_RESP_WH);
++        return ieee80211_acl_set_param_and_flag(
++                                    vap, req->dstmac,
++                                    IEEE80211_ACL_FLAG_PROBE_RESP_WH,
++                                    IEEE80211_ACL_PARAM_PROBE_RSSI_THRESHOLD,
++                                    req->data.bsteering_probe_resp_wh);
+     } else {
+         return ieee80211_acl_clr_flag(vap, req->dstmac,
+                                       IEEE80211_ACL_FLAG_PROBE_RESP_WH);
+@@ -997,15 +1001,26 @@ int wlan_bsteering_get_datarate_info(str
+  */
+ 
+ bool ieee80211_bsteering_is_probe_resp_wh(struct ieee80211vap *vap,
+-                                          const u_int8_t *mac_addr)
++                                          const u_int8_t *mac_addr,
++                                          u_int8_t probe_rssi)
+ {
++    u_int8_t rssi_threshold;
++
+     if(!ieee80211_bsteering_is_vap_enabled(vap) ||
+        !ieee80211_bsteering_is_enabled(vap->iv_ic)) {
+         return false;
+     }
+ 
+-    return ieee80211_acl_flag_check(vap, mac_addr,
+-                                    IEEE80211_ACL_FLAG_PROBE_RESP_WH);
++    if (ieee80211_acl_get_param_if_flag(vap, mac_addr,
++                                        IEEE80211_ACL_FLAG_PROBE_RESP_WH,
++                                        IEEE80211_ACL_PARAM_PROBE_RSSI_THRESHOLD,
++                                        &rssi_threshold)) {
++        if (rssi_threshold == 0 || probe_rssi > rssi_threshold) {
++            return true;
++        }
++    }
++
++    return false;
+ }
+ 
+ /**
+--- a/umac/include/ieee80211_acl.h
++++ b/umac/include/ieee80211_acl.h
+@@ -52,6 +52,7 @@ ieee80211_acl_clr_flag(wlan_if_t vap, co
+  *        potentially others in the future) on individual ACL entries.
+  */
+ enum ieee80211_acl_param {
++    IEEE80211_ACL_PARAM_PROBE_RSSI_THRESHOLD = 0,
+     IEEE80211_ACL_PARAM_MAX
+ };
+ 
+--- a/umac/include/ieee80211_band_steering.h
++++ b/umac/include/ieee80211_band_steering.h
+@@ -116,7 +116,8 @@ void ieee80211_bsteering_send_probereq_e
+  * @return true if the response should be withheld; otherwise false
+  */
+ bool ieee80211_bsteering_is_probe_resp_wh(struct ieee80211vap *vap,
+-                                          const u_int8_t *mac_addr);
++                                          const u_int8_t *mac_addr,
++                                          u_int8_t probe_rssi);
+ 
+ /**
+  * @brief Query the band steering module for whether it is withholding
+--- a/umac/mlme/ieee80211_mgmt_bss.c
++++ b/umac/mlme/ieee80211_mgmt_bss.c
+@@ -477,7 +477,7 @@ ieee80211_recv_probereq(struct ieee80211
+         found_null_bssid = 1;
+     }
+ #if ATH_BAND_STEERING
+-    blocked = ieee80211_bsteering_is_probe_resp_wh(vap, wh->i_addr2);
++    blocked = ieee80211_bsteering_is_probe_resp_wh(vap, wh->i_addr2, rs->rs_rssi);
+ 
+     ieee80211_bsteering_send_probereq_event(vap, wh->i_addr2, rs->rs_rssi, blocked);
+ 

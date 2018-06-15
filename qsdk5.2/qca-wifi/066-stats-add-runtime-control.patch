@@ -1,0 +1,215 @@
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -42,6 +42,7 @@ struct ps_kapi_ctx {
+ 	u64 rx_ampdu_len;
+ 	u64 rx_duration_bss;
+ 	bool cc_old_valid;
++	bool svc[PS_UAPI_IOCTL_SVC_MAX];
+ };
+ 
+ struct ps_kapi_peer_rx_stats {
+@@ -100,5 +101,7 @@ void ps_kapi_sojourn_collect(struct ieee
+ 			     struct ieee80211_node *ni,
+ 			     int tidno,
+ 			     unsigned long timestamp);
++bool ps_kapi_svc_is_enabled(struct ieee80211com *ic,
++			    enum ps_uapi_ioctl_svc svc);
+ 
+ #endif
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -40,6 +40,17 @@ static inline __u64 rol64(__u64 word, un
+ }
+ #endif
+ 
++bool ps_kapi_svc_is_enabled(struct ieee80211com *ic, enum ps_uapi_ioctl_svc svc)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++
++	if (svc >= ARRAY_SIZE(ctx->svc))
++		return false;
++
++	return ctx->svc[svc];
++}
++EXPORT_SYMBOL(ps_kapi_svc_is_enabled);
++
+ static void __ps_kapi_cc_update(struct ieee80211com *ic)
+ {
+ 	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
+@@ -135,6 +146,9 @@ void ps_kapi_cc_update(struct ieee80211c
+ 	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
+ 	unsigned long flags;
+ 
++	if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_SURVEY))
++		return;
++
+ 	spin_lock_irqsave(&ctx->lock, flags);
+ 	__ps_kapi_cc_update(ic);
+ 	spin_unlock_irqrestore(&ctx->lock, flags);
+@@ -226,6 +240,9 @@ static int ps_kapi_survey_update_bss(str
+ 	struct ieee80211vap *vap;
+ 	struct ieee80211_scanner_common *ssc;
+ 
++	if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_SURVEY))
++		return 0;
++
+ 	ctx = &ic->ps_kapi_ctx;
+ 	ssc = (void *)ic->ic_scanner;
+ 
+@@ -248,6 +265,9 @@ void ps_kapi_handle_scan(struct ieee8021
+ 	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
+ 	unsigned long flags;
+ 
++	if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_SURVEY))
++		return;
++
+ 	spin_lock_irqsave(&ctx->lock, flags);
+ 
+ 	ps_kapi_survey_update(ic);
+@@ -535,6 +555,37 @@ static int ps_kapi_ioctl_get_q_util(stru
+ 	return 0;
+ }
+ 
++static int ps_kapi_ioctl_get_svc(struct net_device *dev,
++				 struct iw_request_info *info,
++				 union iwreq_data *wrqu,
++				 char *extra,
++				 struct ps_uapi_ioctl *cmd)
++{
++	struct ieee80211com *ic;
++	struct ps_kapi_ctx *ctx;
++	enum ps_uapi_ioctl_svc svc;
++	u32 modify;
++	u32 enabled;
++
++	ic = ath_netdev_priv(dev);
++	ctx = &ic->ps_kapi_ctx;
++
++	svc = cmd->u.svc.set.svc;
++	modify = cmd->u.svc.set.modify;
++	enabled = cmd->u.svc.set.enabled;
++
++	if (svc >= ARRAY_SIZE(ctx->svc))
++		return -ENOENT;
++
++	if (modify)
++		ctx->svc[svc] = enabled;
++
++	cmd->u.svc.get.svc = svc;
++	cmd->u.svc.get.enabled = ctx->svc[svc];
++
++	return 0;
++}
++
+ typedef int (*ps_kapi_ioctl_op)(struct net_device *dev,
+ 				struct iw_request_info *info,
+ 				union iwreq_data *wrqu,
+@@ -547,6 +598,7 @@ static const ps_kapi_ioctl_op get_ops[PS
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_BSS] = ps_kapi_ioctl_get_survey_bss,
+ 	[PS_UAPI_IOCTL_CMD_PEER_TX_STATS] = ps_kapi_ioctl_get_peer_tx_stats,
+ 	[PS_UAPI_IOCTL_CMD_Q_UTIL] = ps_kapi_ioctl_get_q_util,
++	[PS_UAPI_IOCTL_CMD_SVC] = ps_kapi_ioctl_get_svc,
+ };
+ 
+ int ps_kapi_ioctl(struct net_device *dev,
+@@ -587,8 +639,15 @@ EXPORT_SYMBOL(ps_kapi_ioctl);
+ 
+ int ps_kapi_init(struct ps_kapi_ctx *ctx)
+ {
++	int i;
++
+ 	spin_lock_init(&ctx->lock);
+ 
++	for (i = 0; i < ARRAY_SIZE(ctx->svc); i++)
++		ctx->svc[i] = true;
++
++	ctx->svc[PS_UAPI_IOCTL_SVC_Q_UTIL] = false;
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ps_kapi_init);
+@@ -685,6 +744,9 @@ void ps_kapi_peer_tx_stats_collect_ar900
+ 	bool retry;
+ 	int i;
+ 
++	if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_PEER_TX_STATS))
++		return;
++
+ 	spin_lock_irqsave(&ctx->lock, flags);
+ 
+ 	retry = (rateindex > 0 || longretry > 0);
+@@ -848,6 +910,9 @@ void ps_kapi_peer_tx_stats_collect_ar98x
+ 	u32 attempts;
+ 	u32 success;
+ 
++	if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_PEER_TX_STATS))
++		return;
++
+ 	is_tx_ok = !!(ppdu_end[16] & BIT(31));
+ 	is_ampdu = !!(ppdu_start[13] & BIT(15));
+ 	is_noack = !!(ppdu_start[13] & BIT(16));
+@@ -920,6 +985,8 @@ void ps_kapi_sojourn_collect(struct ieee
+ 	unsigned long flags;
+ 	unsigned long delta_ms;
+ 
++	if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_SOJOURN))
++		return;
+ 
+ 	if (tidno >= ARRAY_SIZE(ni->ps_kapi_peer_tx_stats.sojourn))
+ 		tidno = 0;
+--- a/offload/wlan/txrx/ol_rx.c
++++ b/offload/wlan/txrx/ol_rx.c
+@@ -357,6 +357,9 @@ ps_kapi_inc_rx_duration(struct ieee80211
+     u32 *ptr;
+     u32 num_bytes;
+ 
++    if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_SURVEY))
++        return;
++
+     if (!num_msdus)
+         return;
+ 
+@@ -406,6 +409,9 @@ ps_kapi_inc_rx_stats(struct ieee80211com
+     bool is_data;
+     bool is_retry;
+ 
++    if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_PEER_RX_STATS))
++        return;
++
+     if (!num_msdus)
+         return;
+ 
+--- a/umac/base/ieee80211_common.c
++++ b/umac/base/ieee80211_common.c
+@@ -88,6 +88,9 @@ static OS_TIMER_FUNC(ieee80211_poll_q_ut
+     OS_SET_TIMER(&ic->ic_poll_q_util_timer,
+                  msecs_to_jiffies(ic->ic_poll_q_util_interval_ms));
+ 
++    if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_Q_UTIL))
++        return;
++
+     mask = ic->ic_poll_q_util(ic);
+ 
+     /* This can happen if the device is asleep or
+--- a/umac/txrx/ieee80211_input.c
++++ b/umac/txrx/ieee80211_input.c
+@@ -367,6 +367,9 @@ ps_kapi_inc_rx_duration_ar900x(struct ie
+     struct ps_cmn_rate_info ri = {};
+     int pkt_dur;
+ 
++    if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_SURVEY))
++        return;
++
+     ic->ps_kapi_ctx.rx_ampdu_len += wbuf_get_pktlen(wbuf);
+ 
+     if (!rxs->isaggr || rxs->nomoreaggr) {
+@@ -409,6 +412,9 @@ ps_kapi_inc_rx_stats(struct ieee80211_no
+     ic = ni->ni_ic;
+     stats = &ni->ps_kapi_peer_rx_stats;
+ 
++    if (!ps_kapi_svc_is_enabled(ic, PS_UAPI_IOCTL_SVC_PEER_RX_STATS))
++        return;
++
+     stats->num_mpdus++;
+     stats->num_msdus += num_msdus;
+     stats->num_bytes += num_bytes;

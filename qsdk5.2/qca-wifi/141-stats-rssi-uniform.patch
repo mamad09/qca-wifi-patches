@@ -1,0 +1,214 @@
+OL and DA chips have distinct understanding of
+RSSI and use different means to collect and report
+them. This caused inconsistencies.
+
+This patch relies on combined rssi fix patch to
+deliver coherent rssi samples in rx status and
+uses internal EWMA implementation to smooth out
+samples in the exact same way.
+
+This will affect band steering due to changing the
+source of RSSI samples (and smoothing them out).
+Impact is unknown as of yet.
+
+This is disabled by default in driver itself but
+is expected to be enabled by WM by default.
+--- a/offload/wlan/lmac_offload_if/ol_if_node.c
++++ b/offload/wlan/lmac_offload_if/ol_if_node.c
+@@ -487,6 +487,8 @@ static u_int8_t
+ ol_ath_node_getrssi(const struct ieee80211_node *ni,int8_t chain, u_int8_t flags )
+ {
+     struct ieee80211vap *vap = ni->ni_vap ;
++    if (ni->ni_ic->ic_uniform_rssi)
++        return ATH_RSSI_OUT(ni->ni_rssi_ave);
+     if ( vap ) {
+         if( !ni->ni_rssi &&
+             (wlan_vap_get_opmode(vap) == IEEE80211_M_HOSTAP &&
+--- a/offload/wlan/lmac_offload_if/ol_if_stats.c
++++ b/offload/wlan/lmac_offload_if/ol_if_stats.c
+@@ -613,6 +613,16 @@ ol_update_peer_stats(struct ieee80211_no
+         scn = OL_ATH_SOFTC_NET80211(ic);
+ 
+         mac_stats =  ( ni == vap->iv_bss ) ? &vap->iv_multicast_stats : &vap->iv_unicast_stats;
++        /* Firmware derived reported rssi from HW Rx descriptor's
++         * rssi_comb which is known to not consider all
++         * chains/bandwidths effectively lowering rssi for high data
++         * rates.
++         *
++         * This knob fakes firmware reports with host maintained rssi
++         * that does the right thing.
++         */
++        if (ic->ic_uniform_rssi)
++            peer_stats->peer_rssi = ATH_RSSI_OUT(ni->ni_rssi_ave);
+         ni->ni_rssi = peer_stats->peer_rssi;
+ 
+         if (ic->ic_min_rssi_enable) {
+--- a/offload/wlan/txrx/ol_rx.c
++++ b/offload/wlan/txrx/ol_rx.c
+@@ -623,6 +623,51 @@ ol_rx_fix_rssi(
+     ptr[co] |= new << cs;
+ }
+ 
++static void
++ol_rx_uniform_rssi(
++    struct ieee80211com *ic,
++    struct ieee80211_node *ni,
++    qdf_nbuf_t msdu)
++{
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_txrx_pdev_t *pdev;
++    struct htt_pdev_t *htt_pdev;
++    struct ar_rx_desc_ops *ar_rx_ops;
++    struct rx_desc_base *rxd;
++    u32 *ptr;
++    u8 rssi;
++    int co;
++    int cm;
++    int cs;
++
++    if (!ni)
++        return;
++
++    if (!msdu)
++        return;
++
++    scn = OL_ATH_SOFTC_NET80211(ic);
++    pdev = scn->pdev_txrx_handle;
++    htt_pdev = pdev->htt_pdev;
++    ar_rx_ops = htt_pdev->ar_rx_ops;
++
++    if (unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->is_first_mpdu))) ||
++        unlikely(WARN_ON_ONCE(unlikely(!ar_rx_ops->get_rssi))))
++        return;
++
++    rxd = htt_rx_desc(msdu);
++
++    if (!ar_rx_ops->is_first_mpdu(rxd))
++        return;
++
++    ptr = ar_rx_ops->get_rssi(rxd, &co, &cm, &cs);
++    rssi = (ptr[co] & cm) >> cs;
++    if (rssi & 0x80)
++        return;
++
++    ATH_RSSI_LPF(ni->ni_rssi_ave, rssi);
++}
++
+ void
+ ol_rx_indication_handler(
+     ol_txrx_pdev_handle pdev,
+@@ -778,6 +823,7 @@ ol_rx_indication_handler(
+                     rx_ind_msg, &head_msdu, &tail_msdu, &npackets);
+ 
+                 ol_rx_fix_rssi(ic, npackets ? head_msdu : 0);
++                ol_rx_uniform_rssi(ic, ni, npackets ? head_msdu : 0);
+                 ps_kapi_inc_rx_duration(ic,
+                                         ni,
+                                         head_msdu,
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1496,6 +1496,7 @@ enum {
+     IEEE80211_PARAM_SCAN_FILTER_SSID,
+     IEEE80211_PARAM_VERSIONING,
+     IEEE80211_PARAM_RSSI_COMBINED_FIX,
++    IEEE80211_PARAM_UNIFORM_RSSI,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -3321,6 +3321,8 @@ ieee80211_input_aponly(struct ieee80211_
+             }
+         }
+ 
++        if (rs->rs_isvalidrssi)
++            ATH_RSSI_LPF(ni->ni_rssi_ave, rs->rs_rssi);
+         if (rs->rs_isvalidrssi){
+             ni->ni_rssi = rs->rs_rssi;
+             if(ni->ni_rssi < ni->ni_rssi_min)
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14574,6 +14574,8 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_VERSIONING, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "versioning" },
+     { IEEE80211_PARAM_RSSI_COMBINED_FIX, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "srssicombfix" },
+     { IEEE80211_PARAM_RSSI_COMBINED_FIX, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "grssicombfix" },
++    { IEEE80211_PARAM_UNIFORM_RSSI, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "suniformrssi" },
++    { IEEE80211_PARAM_UNIFORM_RSSI, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "guniformrssi" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/base/ieee80211_node.c
++++ b/umac/base/ieee80211_node.c
+@@ -446,6 +446,7 @@ ieee80211_alloc_node(struct ieee80211_no
+     ieee80211node_clear_whc_rept_info(ni);
+ 
+     ps_kapi_peer_init(ic, ni);
++    ni->ni_rssi_ave = ATH_RSSI_DUMMY_MARKER;
+ 
+     ieee80211_admctl_init(ni);
+ 
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -1712,6 +1712,9 @@ ath_net80211_node_getrssi(const struct i
+     struct ieee80211com *ic = ni->ni_ic;
+     struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
+ 
++    if (ic->ic_uniform_rssi)
++        return ATH_RSSI_OUT(ni->ni_rssi_ave);
++
+ 	return scn->sc_ops->get_noderssi(anode->an_sta, chain, flags);
+ }
+ 
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -585,6 +585,7 @@ typedef struct ieee80211_node {
+ #if ATH_BAND_STEERING
+     unsigned long ni_last_record_rssi_jiffies;
+ #endif
++    int32_t ni_rssi_ave;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -1901,6 +1901,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     int                                 ps_kapi_first_mpdu;
+     int                                 ic_rssi_comb_fix;
+     void                                (*ic_rssi_comb_fix_set)(struct ieee80211com *ic, int enable);
++    int                                 ic_uniform_rssi;
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/umac/txrx/ieee80211_input.c
++++ b/umac/txrx/ieee80211_input.c
+@@ -1626,6 +1626,8 @@ ieee80211_input(struct ieee80211_node *n
+         }
+ 
+         if(rssi_update && rs->rs_isvalidrssi)
++            ATH_RSSI_LPF(ni->ni_rssi_ave, rs->rs_rssi);
++        if(rssi_update && rs->rs_isvalidrssi)
+             ni->ni_rssi = rs->rs_rssi;
+ 
+         IEEE80211_CHECK_DUPPKT(ic, ni,  type, subtype, dir, wh, phy_stats, rs, bad, rxseq);
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2158,6 +2158,9 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+         if (ic->ic_rssi_comb_fix_set)
+             ic->ic_rssi_comb_fix_set(ic, value);
+         break;
++    case IEEE80211_PARAM_UNIFORM_RSSI:
++        ic->ic_uniform_rssi = value;
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+@@ -4520,6 +4523,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_RSSI_COMBINED_FIX:
+         *value = ic->ic_rssi_comb_fix;
+         break;
++    case IEEE80211_PARAM_UNIFORM_RSSI:
++        *value = ic->ic_uniform_rssi;
++        break;
+     case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
+         *value = ic->ic_poll_q_util_interval_ms;
+         break;

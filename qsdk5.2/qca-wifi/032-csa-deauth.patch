@@ -1,0 +1,151 @@
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1485,6 +1485,7 @@ enum {
+     IEEE80211_PARAM_ACTIVITY                    = 538,  /* Percentage of time the radio was unable to tx/rx pkts to/from clients */
+     IEEE80211_PARAM_TXPOW                      = 539,   /* set/get the control frame tx power per vap */
+     IEEE80211_PARAM_THERM,
++    IEEE80211_PARAM_CSA_DEAUTH,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+@@ -2271,4 +2272,11 @@ struct event_data_atf_config {
+ };
+ #endif
+ 
++/* csa_deauth valuse */
++typedef enum {
++    IEEE80211_CSA_DEAUTH_NONE                   = 0,
++    IEEE80211_CSA_DEAUTH_UCAST                  = 1,
++    IEEE80211_CSA_DEAUTH_BCAST                  = 2,
++} IEEE80211_CSA_DEAUTH;
++
+ #endif /* _NET80211_IEEE80211_IOCTL_H_ */
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -11791,7 +11791,8 @@ int
+     wlan_if_t vap = NETDEV_TO_VAP(dev);
+     int *param = (int *) extra;
+ 
+-    QDF_PRINT_INFO(vap->iv_ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "Enabling Channel and channel width Switch Announcement on current channel\n");
++    printk("Starting CSA to channel %d (tbtt = %d, width = %d)\n",
++           param[0], param[1], param[2]);
+     return (ieee80211_ucfg_set_chanswitch(vap, param[0], param[1], param[2]));
+ 
+ }
+@@ -14339,6 +14340,10 @@ static const struct iw_priv_args ieee802
+     IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "g_activity" },
+     { IEEE80211_PARAM_THERM,
+       0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_therm" },
++    { IEEE80211_PARAM_CSA_DEAUTH,
++      IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsadeauth" },
++    { IEEE80211_PARAM_CSA_DEAUTH,
++      0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsadeauth" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -2893,6 +2893,7 @@ typedef struct ieee80211vap {
+     u_int16_t                  iv_htflags;            /* HT state flags */
+     /* array to hold mac addr's for which mgmt frames will not be accepted */
+     struct ieee80211_mac       iv_conf_rej_mgmt[IEEE80211_REJECT_MGMT_MAX];
++    u_int8_t                   iv_csa_deauth;
+ } IEEE80211VAP, *PIEEE80211VAP;
+ 
+ #if QCN_IE
+--- a/umac/mlme/ieee80211_beacon.c
++++ b/umac/mlme/ieee80211_beacon.c
+@@ -14,6 +14,7 @@
+ #include <osdep.h>
+ 
+ #include <ieee80211_var.h>
++#include <ieee80211_ioctl.h>
+ #include <ieee80211_proto.h>
+ #include <ieee80211_channel.h>
+ #include <ieee80211_rateset.h>
+@@ -788,6 +789,43 @@ ieee80211_bcn_prb_template_update(struct
+     return 0;
+ }
+ 
++static void
++ieee80211_csa_deauth(struct ieee80211com *ic)
++{
++    static const u_int8_t bcast_addr[IEEE80211_ADDR_LEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
++    struct ieee80211_node *bcast_ni;
++    struct ieee80211vap *vap;
++
++    TAILQ_FOREACH(vap, &(ic)->ic_vaps, iv_next) {
++        if (!ieee80211_vap_ready_is_set(vap))
++            return;
++
++        if (vap->iv_opmode != IEEE80211_M_HOSTAP)
++            continue;
++
++        switch (vap->iv_csa_deauth) {
++            case IEEE80211_CSA_DEAUTH_NONE:
++                break;
++            case IEEE80211_CSA_DEAUTH_UCAST:
++                wlan_deauth_all_stas(vap);
++                break;
++            case IEEE80211_CSA_DEAUTH_BCAST:
++                bcast_ni = ieee80211_find_txnode(vap, bcast_addr);
++                if (bcast_ni == NULL) {
++                    IEEE80211_DPRINTF(vap, IEEE80211_MSG_OUTPUT,
++                            "%s: could not send broadcast deauth, no node found for %s\n",
++                            __func__, ether_sprintf(bcast_addr));
++                }
++                else {
++                    ieee80211_send_deauth(bcast_ni, IEEE80211_REASON_AUTH_LEAVE);
++                    /* reclaim node */
++                    ieee80211_free_node(bcast_ni);
++                }
++                break;
++        }
++    }
++}
++
+ /*
+  * Update the dynamic parts of a beacon frame based on the current state.
+  */
+@@ -952,6 +990,9 @@ ieee80211_beacon_update(struct ieee80211
+         vap->iv_chanswitch = 0;
+ #endif
+         ic->ic_flags &= ~IEEE80211_F_CHANSWITCH;
++
++        ieee80211_csa_deauth(ic);
++
+         if(ic->ic_chanchange_chwidth != 0){
+             /*Wide Bandwidth Channel Switch for VHT only*/
+             /*In this case need to update phymode*/
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2079,6 +2079,19 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+             retv = wlan_set_param(vap, IEEE80211_RTSCTS_RATE, value);
+         }
+         break;
++    case IEEE80211_PARAM_CSA_DEAUTH:
++        switch (value) {
++        case IEEE80211_CSA_DEAUTH_NONE:
++        case IEEE80211_CSA_DEAUTH_UCAST:
++        case IEEE80211_CSA_DEAUTH_BCAST:
++            vap->iv_csa_deauth = value;
++            retv = 0;
++            break;
++        default:
++            retv = -EINVAL;
++            break;
++        }
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         if (value) {
+             IEEE80211_VAP_CCMPSW_ENCDEC_ENABLE(vap);
+@@ -4365,6 +4378,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_BCAST_RATE:
+         *value = wlan_get_param(vap, IEEE80211_BCAST_RATE);
+         break;
++    case IEEE80211_PARAM_CSA_DEAUTH:
++        *value = vap->iv_csa_deauth;
++        break;
+     case IEEE80211_PARAM_CCMPSW_ENCDEC:
+         *value = vap->iv_ccmpsw_seldec;
+         break;

@@ -1,0 +1,53 @@
+normally peregrine firmware exposes partial cycle counter info through periodic stat update events
+however that's insufficient for our purposes
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -5594,12 +5594,44 @@ static int
+ ol_ath_getrmcounters(struct ieee80211com *ic, struct ieee80211_mib_cycle_cnts *pCnts)
+ {
+     struct ol_ath_softc_net80211 *scn = OL_ATH_SOFTC_NET80211(ic);
++    struct hif_opaque_softc *hif = scn->hif_hdl;
++
++    qdf_spin_lock(&scn->scn_lock);
++
++    /* This is aimed to prevent data bus error messages. If there's at least
++     * one vdev present the device should be in a good enough shape to be ready
++     * for cycle counter register MMIO accesses.
++     */
++    if (scn->vdev_count == 0) {
++        qdf_spin_unlock(&scn->scn_lock);
++        return -EPERM;
++    }
+ 
+     /* "ic->ic_mib_cycle_cnts" gets updated during a periodic stats event */
+-    pCnts->tx_frame_count = scn->mib_cycle_cnts.tx_frame_count;
+-    pCnts->rx_frame_count = scn->mib_cycle_cnts.rx_frame_count;
+-    pCnts->rx_clear_count = scn->mib_cycle_cnts.rx_clear_count;
+-    pCnts->cycle_count = scn->mib_cycle_cnts.cycle_count;
++    switch (scn->target_type) {
++        case TARGET_TYPE_AR900B:
++        case TARGET_TYPE_IPQ4019:
++        case TARGET_TYPE_QCA9984:
++        case TARGET_TYPE_QCA9888:
++            hif_diag_read_access(hif, 0x3123c, &pCnts->tx_frame_count); /* MAC_PCU_TX_FRAME_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x31238, &pCnts->rx_frame_count); /* MAC_PCU_RX_FRAME_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x31240, &pCnts->rx_clear_count); /* MAC_PCU_RX_CLEAR_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x31204, &pCnts->cycle_count); /* MAC_PCU_CYCLE_CNT_ADDRESS */
++            break;
++        case TARGET_TYPE_AR9888:
++        case TARGET_TYPE_AR9888V2:
++            hif_diag_read_access(hif, 0x280ec, &pCnts->tx_frame_count); /* MAC_PCU_TX_FRAME_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x280f0, &pCnts->rx_frame_count); /* MAC_PCU_RX_FRAME_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x280f4, &pCnts->rx_clear_count); /* MAC_PCU_RX_CLEAR_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x28328, &pCnts->rx_clear_diff_count); /* MAC_PCU_RX_CLEAR_DIFF_CNT_ADDRESS */
++            hif_diag_read_access(hif, 0x280f8, &pCnts->cycle_count); /* MAC_PCU_CYCLE_CNT_ADDRESS */
++            break;
++        default:
++            WARN(1, "%s: unhandled target_type = %d", scn->target_type);
++            break;
++    }
++
++    qdf_spin_unlock(&scn->scn_lock);
+ 
+     /* "is_rx_active" and "is_tx_active" not being used, but for safety, set it to 0 */
+     pCnts->is_rx_active = 0;

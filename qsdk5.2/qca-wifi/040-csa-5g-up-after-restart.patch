@@ -1,0 +1,80 @@
+From a high level this fixes:
+ - possible DFS violation (blasting on radar
+   channels without CAC)
+ - deaf state after onboarding or recovery
+
+Peregrine firmware loses track of BSS channel in
+some cases. I've found the following case to fail
+pretty badly:
+
+ - create 1 sta vap (no other vaps are present)
+ - connect 1 sta vap to parent ap
+ - do scan
+ - ping run on STA to AP works
+ - make parent ap CSA to another channel
+ - ping run on STA to AP works
+ - do scan on sta vap
+ - ping run on STA to AP does not work anymore
+ - FWLOG XRETRY/DEV_RESET show up every second as
+   long as ping is running on STA
+ - transmissions are blasted by STA on
+   weather/radar freq=5700 (verified with ath10k
+   running tcpdump)
+
+This is actually possible to trigger during
+onboarding or recovery where AP vaps aren't
+started until STA connects. If CSA happens during
+that set-up period the device can end up being
+deaf (and violate regulatory).
+--- a/offload/wlan/umac_offload_if/ol_if_resmgr.c
++++ b/offload/wlan/umac_offload_if/ol_if_resmgr.c
+@@ -353,6 +353,40 @@ static int _ieee80211_resmgr_vap_stop(ie
+     return ret;
+ }
+ 
++static void
++ol_vdev_refresh_vdev_up(ol_scn_t scn,
++                        struct ieee80211vap *vap,
++                        wmi_host_vdev_start_resp *resp)
++{
++    struct ol_ath_vap_net80211 *avn;
++    struct ieee80211_node *ni;
++    struct vdev_up_params param = {};
++    int err;
++    char *bssid;
++
++    avn = OL_ATH_VAP_NET80211(vap);
++
++    if (resp->resp_type != WMI_HOST_VDEV_RESTART_RESP_EVENT)
++        return;
++
++    if (vap->iv_opmode != IEEE80211_M_STA)
++        return;
++
++    ni = vap->iv_bss;
++    bssid = ni->ni_bssid;
++    param.vdev_id = avn->av_if_id;
++    param.assoc_id = IEEE80211_AID(ni->ni_associd);
++
++    err = wmi_unified_vdev_up_send(scn->wmi_handle, bssid, &param);
++    if (err) {
++        printk("%s: [%s, %i] failed to vdev up: %d\n",
++                __func__,
++                vap->iv_netdev_name,
++                avn->av_if_id,
++                err);
++    }
++}
++
+ static int
+ ol_vdev_wmi_event_handler(ol_scn_t sc, u_int8_t *data, u_int16_t datalen)
+ {
+@@ -392,6 +426,8 @@ ol_vdev_wmi_event_handler(ol_scn_t sc, u
+ 
+     spin_lock_dpc(&vaphandle->init_lock);
+ 
++    ol_vdev_refresh_vdev_up(scn, vaphandle, &vdev_start_resp);
++
+     switch (vaphandle->iv_opmode) {
+ 
+         case IEEE80211_M_MONITOR:

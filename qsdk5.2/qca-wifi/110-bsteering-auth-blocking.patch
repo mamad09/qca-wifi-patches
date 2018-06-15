@@ -1,0 +1,240 @@
+Allow band steering to control authentication respones.  They
+can be ignored, or rejected with a configured reason code when
+request is outside of a given RSSI range defined by HWM/LWM
+--- a/include/ieee80211_band_steering_api.h
++++ b/include/ieee80211_band_steering_api.h
+@@ -450,6 +450,9 @@ typedef struct ieee80211_bsteering_rssi_
+ typedef struct ieee80211_bsteering_cli_param_t {
+     u_int8_t  probe_rssi_hwm;
+     u_int8_t  probe_rssi_lwm;
++    u_int8_t  auth_rssi_hwm;
++    u_int8_t  auth_rssi_lwm;
++    u_int8_t  auth_reject_reason;
+     u_int8_t  inact_rssi_xing;
+     u_int8_t  low_rssi_xing;
+     u_int8_t  low_rate_rssi_xing;
+--- a/umac/band_steering/band_steering.c
++++ b/umac/band_steering/band_steering.c
+@@ -1066,6 +1066,56 @@ bool ieee80211_bsteering_is_probe_resp_w
+         else if (rssi_lwm > 0 && probe_rssi < rssi_lwm) {
+             return true;
+         }
++        else if (WARN_ON_ONCE(rssi_hwm == 0 && rssi_lwm == 0)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++/**
++ * @brief Query the band steering module for whether it is blocking
++ *        auth requests for the given MAC address on this VAP.
++ *
++ * @param [in]  vap        The VAP on which the probe request was received
++ * @param [in]  mac_addr   The MAC address of the client that sent the probe
++ *                         request
++ * @param [in]  auth_rssi  The RSSI of the probe request
++ * @param [out] rej_reason The reason code when rejecting (0 = no response)
++ *
++ * @return true if auth should be blocked; otherwise false
++ */
++bool ieee80211_bsteering_is_auth_blocked(struct ieee80211vap *vap,
++                                         const u_int8_t *mac_addr,
++                                         u_int8_t auth_rssi,
++                                         u_int8_t *rej_reason)
++{
++    u_int8_t rssi_hwm = 0;
++    u_int8_t rssi_lwm = 0;
++
++    if(!ieee80211_bsteering_is_vap_enabled(vap) ||
++       !ieee80211_bsteering_is_enabled(vap->iv_ic)) {
++        return false;
++    }
++
++    if (ieee80211_acl_flag_check(vap, mac_addr, IEEE80211_ACL_FLAG_AUTH_BLOCK)) {
++        ieee80211_acl_get_param(vap, mac_addr,
++                                IEEE80211_ACL_PARAM_AUTH_RSSI_HWM, &rssi_hwm);
++        ieee80211_acl_get_param(vap, mac_addr,
++                                IEEE80211_ACL_PARAM_AUTH_RSSI_LWM, &rssi_lwm);
++        if (rej_reason) {
++            ieee80211_acl_get_param(vap, mac_addr,
++                                    IEEE80211_ACL_PARAM_AUTH_REJECT_REASON,
++                                    rej_reason);
++        }
++
++        if (rssi_hwm > 0 && auth_rssi > rssi_hwm) {
++            return true;
++        }
++        else if (rssi_lwm > 0 && auth_rssi < rssi_lwm) {
++            return true;
++        }
+         else if (rssi_hwm == 0 && rssi_lwm == 0) {
+             return true;
+         }
+@@ -1460,6 +1510,32 @@ wlan_bsteering_set_cli_params(struct iee
+         return ret;
+     }
+ 
++    if (req->data.bsteering_cli_param.auth_rssi_hwm ||
++        req->data.bsteering_cli_param.auth_rssi_lwm) {
++        ret = ieee80211_acl_set_param_and_flag(
++                                    vap, req->dstmac,
++                                    IEEE80211_ACL_FLAG_AUTH_BLOCK,
++                                    IEEE80211_ACL_PARAM_AUTH_RSSI_HWM,
++                                    req->data.bsteering_cli_param.auth_rssi_hwm);
++        if (ret == 0) {
++            ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                    IEEE80211_ACL_PARAM_AUTH_RSSI_LWM,
++                                    req->data.bsteering_cli_param.auth_rssi_lwm);
++        }
++        if (ret == 0) {
++            ret = ieee80211_acl_set_param(vap, req->dstmac,
++                                    IEEE80211_ACL_PARAM_AUTH_REJECT_REASON,
++                                    req->data.bsteering_cli_param.auth_reject_reason);
++        }
++    }
++    else {
++        ret = ieee80211_acl_clr_flag(vap, req->dstmac,
++                                     IEEE80211_ACL_FLAG_AUTH_BLOCK);
++    }
++    if (ret < 0) {
++        return ret;
++    }
++
+     ret = ieee80211_acl_set_param(vap, req->dstmac,
+                                   IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
+                                   req->data.bsteering_cli_param.inact_rssi_xing);
+@@ -1524,6 +1600,30 @@ wlan_bsteering_get_cli_params(struct iee
+         req->data.bsteering_cli_param.probe_rssi_lwm = 0;
+     }
+ 
++    if (ieee80211_acl_flag_check(vap, req->dstmac, IEEE80211_ACL_FLAG_AUTH_BLOCK)) {
++        ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_AUTH_RSSI_HWM,
++                                      &req->data.bsteering_cli_param.auth_rssi_hwm);
++        if (ret == 0) {
++            ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_AUTH_RSSI_LWM,
++                                      &req->data.bsteering_cli_param.auth_rssi_lwm);
++        }
++        if (ret == 0) {
++            ret = ieee80211_acl_get_param(vap, req->dstmac,
++                                      IEEE80211_ACL_PARAM_AUTH_REJECT_REASON,
++                                      &req->data.bsteering_cli_param.auth_reject_reason);
++        }
++        if (ret < 0) {
++            return ret;
++        }
++    }
++    else {
++        req->data.bsteering_cli_param.auth_rssi_hwm = 0;
++        req->data.bsteering_cli_param.auth_rssi_lwm = 0;
++        req->data.bsteering_cli_param.auth_reject_reason = 0;
++    }
++
+     ret = ieee80211_acl_get_param(vap, req->dstmac,
+                                   IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
+                                   &req->data.bsteering_cli_param.inact_rssi_xing);
+--- a/umac/include/ieee80211_acl.h
++++ b/umac/include/ieee80211_acl.h
+@@ -34,6 +34,7 @@ enum ieee80211_acl_flag {
+     IEEE80211_ACL_FLAG_ACL_LIST_1    = 1 << 1,  /* Denotes ACL list 1 */
+     IEEE80211_ACL_FLAG_ACL_LIST_2    = 1 << 2,  /* Denotes ACL list 2 */
+     IEEE80211_ACL_FLAG_AUTH_ALLOW    = 1 << 3,  /* Denotes Auth Allow */
++    IEEE80211_ACL_FLAG_AUTH_BLOCK    = 1 << 4,  /* Block auth requests */
+ };
+ 
+ #if ATH_BAND_STEERING
+@@ -54,6 +55,9 @@ ieee80211_acl_clr_flag(wlan_if_t vap, co
+ enum ieee80211_acl_param {
+     IEEE80211_ACL_PARAM_PROBE_RSSI_HWM = 0,
+     IEEE80211_ACL_PARAM_PROBE_RSSI_LWM,
++    IEEE80211_ACL_PARAM_AUTH_RSSI_HWM,
++    IEEE80211_ACL_PARAM_AUTH_RSSI_LWM,
++    IEEE80211_ACL_PARAM_AUTH_REJECT_REASON,
+     IEEE80211_ACL_PARAM_BS_INACT_RSSI_XING,
+     IEEE80211_ACL_PARAM_BS_LOW_RSSI_XING,
+     IEEE80211_ACL_PARAM_BS_LOW_RATE_RSSI_XING,
+--- a/umac/include/ieee80211_band_steering.h
++++ b/umac/include/ieee80211_band_steering.h
+@@ -148,6 +148,23 @@ bool ieee80211_bsteering_is_probe_resp_w
+                                           u_int8_t sta_rssi);
+ 
+ /**
++ * @brief Query the band steering module for whether it is blocking
++ *        auth requests for the given MAC address on this VAP.
++ *
++ * @param [in]  vap        The VAP on which the probe request was received
++ * @param [in]  mac_addr   The MAC address of the client that sent the probe
++ *                         request
++ * @param [in]  auth_rssi  The RSSI of the probe request
++ * @param [out] rej_reason The reason code when rejecting (0 = no response)
++ *
++ * @return true if auth should be blocked; otherwise false
++ */
++bool ieee80211_bsteering_is_auth_blocked(struct ieee80211vap *vap,
++                                         const u_int8_t *mac_addr,
++                                         u_int8_t auth_rssi,
++                                         u_int8_t *rej_reason);
++
++/**
+  * @brief Generate an event indicating that an authentication message
+  *        was sent with a failure code.
+  *
+--- a/umac/mlme/ieee80211_mlme_ap.c
++++ b/umac/mlme/ieee80211_mlme_ap.c
+@@ -741,6 +741,11 @@ int mlme_recv_auth_ap(struct ieee80211_n
+     u_int16_t                     frame_seq;
+     u_int16_t                     indication_status = IEEE80211_STATUS_SUCCESS,response_status = IEEE80211_STATUS_SUCCESS ;
+     bool                          send_auth_response=true,indicate=true;
++#if ATH_BAND_STEERING
++    u_int8_t bs_rej_reason;
++    bool bs_blocked;
++    bool bs_rejected;
++#endif
+ 
+     wh = (struct ieee80211_frame *) wbuf_header(wbuf);
+ 
+@@ -749,6 +754,24 @@ int mlme_recv_auth_ap(struct ieee80211_n
+         return -1;
+     }
+ 
++#if ATH_BAND_STEERING
++    bs_rej_reason = 0;
++    bs_blocked = ieee80211_bsteering_is_auth_blocked(vap,
++                                                     wh->i_addr2,
++                                                     rs->rs_rssi,
++                                                     &bs_rej_reason);
++    bs_rejected = (bs_blocked && (bs_rej_reason > 0));
++
++    if (bs_blocked && !bs_rejected) {
++        /* Ignore auth frame */
++        IEEE80211_DPRINTF(vap, IEEE80211_MSG_ACL,
++                              "[%s] auth: ignored by band steering\n",ether_sprintf(wh->i_addr2));
++        return 0;
++    }
++#else /* not ATH_BAND_STEERING */
++    /* To silence compiler warning about unused variable. */
++    (void) rs;
++#endif /* not ATH_BAND_STEERING */
+ 
+     IEEE80211_NOTE_MAC(vap, IEEE80211_MSG_AUTH, wh->i_addr2,
+                        "recv auth frame with algorithm %d seq %d \n", algo, seq);
+@@ -849,6 +872,16 @@ int mlme_recv_auth_ap(struct ieee80211_n
+             }
+ #endif /* ATH_BAND_STEERING */
+         }
++#if ATH_BAND_STEERING
++        if (bs_rejected) {
++            IEEE80211_DPRINTF(vap, IEEE80211_MSG_ACL,
++                              "[%s] auth: rejected by band steering, reason=%u\n",
++                              ether_sprintf(wh->i_addr2), bs_rej_reason);
++            response_status = bs_rej_reason;
++            indication_status = IEEE80211_STATUS_REFUSED;
++            break;
++        }
++#endif /* ATH_BAND_STEERING */
+         if (IEEE80211_VAP_IS_COUNTERM_ENABLED(vap)) {
+             IEEE80211_DPRINTF(vap, IEEE80211_MSG_AUTH | IEEE80211_MSG_CRYPTO,
+                               "[%s] auth: TKIP countermeasures enabled \n",ether_sprintf(wh->i_addr2));

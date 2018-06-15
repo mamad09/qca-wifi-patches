@@ -1,0 +1,40 @@
+--- a/hal/ah.h
++++ b/hal/ah.h
+@@ -1111,6 +1111,7 @@ typedef struct halCounters {
+     u_int32_t   tx_frame_count;
+     u_int32_t   rx_frame_count;
+     u_int32_t   rx_clear_count;
++    u_int32_t   rx_clear_diff_count;
+     u_int32_t   cycle_count;
+     u_int8_t    is_rx_active;     // true (1) or false (0)
+     u_int8_t    is_tx_active;     // true (1) or false (0)
+--- a/hal/ar9300/ar9300_misc.c
++++ b/hal/ar9300/ar9300_misc.c
+@@ -2152,6 +2152,7 @@ ar9300_get_mib_cycle_counts(struct ath_h
+     p_cnts->tx_frame_count = OS_REG_READ(ah, AR_TFCNT);
+     p_cnts->rx_frame_count = OS_REG_READ(ah, AR_RFCNT);
+     p_cnts->rx_clear_count = OS_REG_READ(ah, AR_RCCNT);
++    p_cnts->rx_clear_diff_count = OS_REG_READ(ah, AR_EXTRCCNT);
+     p_cnts->cycle_count   = OS_REG_READ(ah, AR_CCCNT);
+     p_cnts->is_tx_active   = (OS_REG_READ(ah, AR_TFCNT) ==
+                            p_cnts->tx_frame_count) ? false : true;
+--- a/include/_ieee80211.h
++++ b/include/_ieee80211.h
+@@ -651,6 +651,7 @@ struct ieee80211_mib_cycle_cnts {
+     u_int32_t   tx_frame_count;
+     u_int32_t   rx_frame_count;
+     u_int32_t   rx_clear_count;
++    u_int32_t   rx_clear_diff_count;
+     u_int32_t   cycle_count;
+     u_int8_t    is_rx_active;
+     u_int8_t    is_tx_active;
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -7908,6 +7908,7 @@ ath_getrmcounters(struct ieee80211com *i
+         pCnts->tx_frame_count = counters.tx_frame_count;
+         pCnts->rx_frame_count = counters.rx_frame_count;
+         pCnts->rx_clear_count = counters.rx_clear_count;
++        pCnts->rx_clear_diff_count = counters.rx_clear_diff_count;
+         pCnts->cycle_count = counters.cycle_count;
+         pCnts->is_rx_active = counters.is_rx_active;
+         pCnts->is_tx_active = counters.is_tx_active;

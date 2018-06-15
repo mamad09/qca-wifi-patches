@@ -1,0 +1,43 @@
+When AP interface is started and there are other
+interfaces already running it implies the channel
+is already known. It makes perfect sense to try
+to re-use that, regardless of the desired channel
+(which can be NULL or something non-compatible).
+
+This should fix some cases where the following
+messages is seen in logs:
+
+_ieee80211_resmgr_vap_start: [home-ap-50, 9]
+refusing due to unsupported multi-chan (on: 153,
+req: 40)
+
+If this is seen it may mean that given AP
+interface will not be brought up at all and
+nothing will try to retry until later, if at all,
+preventing any clients from connecting.
+--- a/os/linux/src/osif_umac.c
++++ b/os/linux/src/osif_umac.c
+@@ -6778,6 +6778,12 @@ osif_vap_init(struct net_device *dev, in
+             }
+ #endif
+             chan = wlan_get_current_channel(vap, false);
++            if ((!chan || chan == IEEE80211_CHAN_ANYC) && ieee80211_vaps_active(vap->iv_ic)) {
++                chan = vap->iv_ic->ic_curchan;
++                printk("%s: inheriting channel %d for %s\n",
++                       __func__, chan->ic_ieee, vap->iv_netdev_name);
++            }
++
+             if ((!chan) || (chan == IEEE80211_CHAN_ANYC)) {
+                 if (ieee80211_vap_ext_ifu_acs_is_set(vap)) {
+                     /* If any VAP is active, the channel is already selected
+--- a/umac/mlme/ieee80211_mlme_ap.c
++++ b/umac/mlme/ieee80211_mlme_ap.c
+@@ -409,6 +409,8 @@ mlme_create_infra_bss(struct ieee80211va
+      */
+     if (numvaps_up){
+         chan =  ic->ic_curchan;
++        printk("%s: inheriting channel %d for %s\n",
++               __func__, chan->ic_ieee, vap->iv_netdev_name);
+     }
+     else {
+         chan =  vap->iv_des_chan[vap->iv_des_mode];

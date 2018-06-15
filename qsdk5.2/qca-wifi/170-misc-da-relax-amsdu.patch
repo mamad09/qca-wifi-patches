@@ -1,0 +1,417 @@
+Stock driver performed A-MSDU on DA radio only for
+packets that were recognized as IPv4 TCP.
+
+It would not perform it on IPv6 TCP traffic nor
+would it work when GRE or SoftWDS encapsulation
+was used.
+
+The patch relaxes A-MSDU to apply regardless of
+packet type as long as its length falls within a
+fixed (an increased, compared to stock) size.
+A-MSDU is now built opportunistically with no
+fixed delay (compared to up to 15ms with stock)
+and should be nicer for interactive use (remote
+desktops, shells, online games), especially with
+multiple mesh hops.
+
+This is enabled by default and can be controlled:
+
+  iwpriv ath0 srelaxamsdu 0
+  iwpriv ath0 srelaxamsdu 1
+  iwpriv ath0 grelaxamsdu
+--- a/umac/include/if_athproto.h
++++ b/umac/include/if_athproto.h
+@@ -51,7 +51,7 @@ struct athl2p_tunnel_hdr {
+  */
+ #ifdef ATH_AMSDU
+ #define AMSDU_TIMEOUT 15
+-#define AMSDU_MAX_SUBFRM_LEN 100
++#define AMSDU_MAX_SUBFRM_LEN (ic->ic_relax_amsdu.enabled ? 150 : 100)
+ #define AMSDU_BUFFER_HEADROOM 64
+ #ifdef ATH_SUPPORT_HTC
+ #define AMSDU_MAX_BUFFER_SIZE 1568
+--- a/umac/txrx/ieee80211_output.c
++++ b/umac/txrx/ieee80211_output.c
+@@ -1984,6 +1984,8 @@ ieee80211_amsdu_check(struct ieee80211va
+     if (wbuf_is_uapsd(wbuf) || wbuf_is_moredata(wbuf)) {
+         return 1;
+     }
++    if (vap->iv_ic->ic_relax_amsdu.enabled)
++        return 0;
+     if (IEEE80211_VAP_IS_SEND_80211_ENABLED(vap)) {
+        return ieee80211_80211frm_amsdu_check(wbuf);
+     }
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -179,6 +179,8 @@ ath_amsdu_sched_check_aponly(struct ath_
+ {
+     struct ath_node *an;
+     an = ATH_NODE(anode->an_sta);
++    if (scn->sc_ic.ic_relax_amsdu.enabled)
++        return scn->sc_ops->txq_depth(scn->sc_dev, scn->sc_ac2q[priority]) >= 1;
+     if ((ATH_RATE_OUT(an->an_avgrxrate) <= 162000) ||
+         (scn->sc_ops->txq_depth(scn->sc_dev, scn->sc_ac2q[priority]) >= 1))
+     {
+@@ -193,6 +195,8 @@ ieee80211_amsdu_check_aponly(struct ieee
+     if (wbuf_is_uapsd(wbuf) || wbuf_is_moredata(wbuf)) {
+         return 1;
+     }
++    if (vap->iv_ic->ic_relax_amsdu.enabled)
++        return 0;
+ 
+     return ieee80211_8023frm_amsdu_check(wbuf);
+ }
+@@ -279,6 +283,11 @@ ath_amsdu_send_aponly(wbuf_t wbuf)
+             ATH_AMSDU_TXQ_UNLOCK(scn);
+             return wbuf;
+         }
++        if (ic->ic_relax_amsdu.enabled &&
++            !ath_amsdu_sched_check_aponly(scn, anode, wbuf_get_priority(wbuf))) {
++            ATH_AMSDU_TXQ_UNLOCK(scn);
++            return wbuf;
++        }
+         amsdu_wbuf = wbuf_alloc(scn->sc_osdev, WBUF_TX_DATA, AMSDU_MAX_BUFFER_SIZE);
+         /* No AMSDU buffer available */
+         if (amsdu_wbuf == NULL) {
+@@ -970,6 +979,9 @@ ath_tx_processq_aponly(struct ath_softc
+     u_int8_t n_tail_fail = 0;
+ #endif
+ 
++    if (sc->sc_ieee_ops->flush_amsdu)
++        sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+     if (unlikely(txq == sc->sc_uapsdq)) {
+         DPRINTF(sc, ATH_DEBUG_UAPSD, "%s: reaping U-APSD txq\n", __func__);
+ #ifdef ATH_SUPPORT_UAPSD
+@@ -1295,6 +1307,9 @@ ath_tx_processq_aponly(struct ath_softc
+          * schedule any pending packets if aggregation is enabled
+          */
+         {
++          if (sc->sc_ieee_ops->flush_amsdu)
++              sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+           ATH_TXQ_LOCK(txq);
+           ath_txq_schedule(sc, txq);
+           ATH_TXQ_UNLOCK(txq);
+@@ -2077,6 +2092,8 @@ ath_tx_edma_tasklet_compact(ath_dev_t de
+          * schedule any pending packets if aggregation is enabled
+          */
+ #ifndef ATH_RESTRICTED_TXQSCHED
++        if (sc->sc_ieee_ops->flush_amsdu)
++            sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
+         /* Delay Scheduling the txqs untill all are completed */
+         ATH_TXQ_LOCK(txq);
+         ath_txq_schedule(sc, txq);
+@@ -2108,6 +2125,9 @@ ath_tx_edma_tasklet_compact(ath_dev_t de
+         if (txqsched & (1 << i)) {
+             struct ath_txq *schedtxq = &sc->sc_txq[i];
+             if(schedtxq != NULL && schedtxq->axq_depth==0){
++                if (sc->sc_ieee_ops->flush_amsdu)
++                    sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+                 ATH_TXQ_LOCK(schedtxq);
+                 ath_txq_schedule(sc, schedtxq);
+                 ATH_TXQ_UNLOCK(schedtxq);
+@@ -2578,6 +2598,9 @@ ath_tx_edma_tasklet_aponly(ath_dev_t dev
+          * schedule any pending packets if aggregation is enabled
+          */
+ 
++        if (sc->sc_ieee_ops->flush_amsdu)
++            sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+         ATH_TXQ_LOCK(txq);
+         ath_txq_schedule(sc, txq);
+         ATH_TXQ_UNLOCK(txq);
+--- a/umac/if_lmac/if_ath_amsdu.c
++++ b/umac/if_lmac/if_ath_amsdu.c
+@@ -102,6 +102,36 @@ ath_amsdu_tx_drain(struct ath_softc_net8
+         }
+     } while (!TAILQ_EMPTY(&scn->sc_amsdu_txq));
+ }
++static int
++ath_amsdu_is_busy(struct ath_softc_net80211 *scn,
++                  struct ath_amsdu_tx *amsdutx)
++{
++    struct ath_softc *sc;
++    wbuf_t wbuf;
++    int qnum;
++    int ac;
++
++    if (!scn->sc_ic.ic_relax_amsdu.enabled)
++        return 0;
++
++    wbuf = amsdutx->amsdu_tx_buf;
++
++    if (!wbuf)
++        return 0;
++
++    ac = wbuf_get_priority(wbuf) & 3;
++    qnum = scn->sc_ac2q[ac];
++
++    if (scn->sc_ops->txq_depth(scn->sc_dev, qnum) == 0)
++        return 0;
++
++    sc = scn->sc_dev;
++
++    if (test_and_clear_bit(qnum, &sc->sc_amsdu_qnum_force))
++        return 0;
++
++    return 1;
++}
+ /*
+  * This global timer routine checks a queue for posted AMSDU events.
+  * For every AMSDU that we started, we add an event to this queue.
+@@ -121,6 +151,10 @@ ath_amsdu_flush_timer(void *arg)
+             ATH_AMSDU_TXQ_UNLOCK(scn);
+             break;
+         }
++        if (ath_amsdu_is_busy(scn, amsdutx)) {
++            ATH_AMSDU_TXQ_UNLOCK(scn);
++            break;
++        }
+         TAILQ_REMOVE(&scn->sc_amsdu_txq, amsdutx, amsdu_qelem);
+         amsdutx->sched = 0;
+         ATH_AMSDU_TXQ_UNLOCK(scn);
+@@ -136,6 +170,9 @@ int
+ ath_amsdu_sched_check(struct ath_softc_net80211 *scn, struct ath_node_net80211 *anode,
+                       int priority)
+ {
++    if (scn->sc_ic.ic_relax_amsdu.enabled)
++        return scn->sc_ops->txq_depth(scn->sc_dev, scn->sc_ac2q[priority]) >= 1;
++
+     if ((scn->sc_ops->get_noderate(anode->an_sta, IEEE80211_RATE_RX) <= 162000) ||
+         (scn->sc_ops->txq_depth(scn->sc_dev, scn->sc_ac2q[priority]) >= 1))
+     {
+@@ -235,6 +272,11 @@ ath_amsdu_send(wbuf_t wbuf)
+             ATH_AMSDU_TXQ_UNLOCK(scn);
+             return wbuf;
+         }
++        if (ic->ic_relax_amsdu.enabled &&
++            !ath_amsdu_sched_check(scn, anode, wbuf_get_priority(wbuf))) {
++            ATH_AMSDU_TXQ_UNLOCK(scn);
++            return wbuf;
++        }
+         amsdu_wbuf = wbuf_alloc(scn->sc_osdev, WBUF_TX_DATA, AMSDU_MAX_BUFFER_SIZE);
+         /* No AMSDU buffer available */
+         if (amsdu_wbuf == NULL) {
+@@ -285,6 +327,7 @@ ath_amsdu_attach(struct ath_softc_net802
+ void
+ ath_amsdu_detach(struct ath_softc_net80211 *scn)
+ {
++    scn->sc_ic.ic_relax_amsdu.enabled = 0;
+     ATH_AMSDU_TXQ_LOCK_DESTROY(scn);
+     ath_cancel_timer(&scn->sc_amsdu_flush_timer, CANCEL_NO_SLEEP);
+     ath_free_timer(&scn->sc_amsdu_flush_timer);
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1497,6 +1497,7 @@ enum {
+     IEEE80211_PARAM_VERSIONING,
+     IEEE80211_PARAM_RSSI_COMBINED_FIX,
+     IEEE80211_PARAM_UNIFORM_RSSI,
++    IEEE80211_PARAM_RELAX_AMSDU,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14578,6 +14578,8 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_RSSI_COMBINED_FIX, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "grssicombfix" },
+     { IEEE80211_PARAM_UNIFORM_RSSI, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "suniformrssi" },
+     { IEEE80211_PARAM_UNIFORM_RSSI, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "guniformrssi" },
++    { IEEE80211_PARAM_RELAX_AMSDU, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "srelaxamsdu" },
++    { IEEE80211_PARAM_RELAX_AMSDU, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "grelaxamsdu" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -20,6 +20,7 @@
+ #include "if_llc.h"
+ #include "if_ath_quiet.h"
+ #include "if_ath_mat.h"
++#include "if_athproto.h"
+ 
+ #include "asf_amem.h"     /* asf_amem_setup */
+ #include "asf_print.h"    /* asf_print_setup */
+@@ -7969,6 +7970,23 @@ static void ath_net80211_update_ack_rssi
+     ieee80211_update_ack_rssi(node, rssi);
+ }
+ 
++static void ath_net80211_flush_amsdu(ieee80211_handle_t ieee, int qnum)
++{
++    struct ath_softc_net80211 *scn;
++    struct ieee80211com *ic;
++    struct ath_softc *sc;
++
++    ic = NET80211_HANDLE(ieee);
++    scn = ATH_SOFTC_NET80211(ic);
++    sc = ATH_DEV_TO_SC(scn->sc_dev);
++
++    if (!ic->ic_relax_amsdu.enabled)
++        return;
++
++    set_bit(qnum, &sc->sc_amsdu_qnum_force);
++    ath_start_timer(&scn->sc_amsdu_flush_timer);
++}
++
+ struct ieee80211_ops net80211_ops = {
+     ath_get_netif_settings,                 /* get_netif_settings */
+     ath_mcast_merge,                        /* netif_mcast_merge  */
+@@ -8154,6 +8172,7 @@ struct ieee80211_ops net80211_ops = {
+     ath_net80211_set_min_rssi,                   /* set_min_rssi */
+     ath_net80211_get_min_rssi,                   /* get_min_rssi */
+     .update_ack_rssi = ath_net80211_update_ack_rssi,
++    .flush_amsdu = ath_net80211_flush_amsdu,
+ };
+ 
+ static void
+@@ -9151,6 +9170,17 @@ ath_net80211_rssi_comb_fix_set(struct ie
+         scn->sc_ops->rssi_comb_fix_set(scn->sc_dev, enable);
+ }
+ 
++static void
++ath_net80211_relax_amsdu_op_update(struct ieee80211com *ic)
++{
++    struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
++
++    ath_set_timer_period(&scn->sc_amsdu_flush_timer,
++                         (ic->ic_relax_amsdu.enabled
++                          ? 0
++                          : AMSDU_TIMEOUT));
++}
++
+ #if ATH_BAND_STEERING
+ static bool
+ ath_net80211_bs_set_params(struct ieee80211com *ic,
+@@ -9233,6 +9263,21 @@ static unsigned long ath_net80211_poll_q
+         return 0;
+ }
+ 
++static void ath_attach_relax_amsdu(struct ieee80211com *ic)
++{
++    ic->ic_relax_amsdu.update = ath_net80211_relax_amsdu_op_update;
++
++    /* This is almost always desired and would
++     * need to be enabled by WM1, WM2 or whatnot
++     * (which would be painfulto maintain).
++     * Instead do it in driver.  This can still be
++     * disabled so (regression) testing can re-use
++     * same software build.
++     */
++    ic->ic_relax_amsdu.enabled = 1;
++    ic->ic_relax_amsdu.update(ic);
++}
++
+ int
+ ath_attach(u_int16_t devid, void *base_addr,
+            struct ath_softc_net80211 *scn,
+@@ -9716,6 +9761,7 @@ ath_attach(u_int16_t devid, void *base_a
+     ic->ic_get_mac_prealloc_idmask = ath_net80211_get_mac_prealloc_idmask;
+     ic->ic_cc_clk_khz = ath_net80211_cc_clk_khz;
+     ic->ic_rssi_comb_fix_set = ath_net80211_rssi_comb_fix_set;
++    ath_attach_relax_amsdu(ic);
+ 
+     /* Attach the direct attach print scan function */
+     ic->ic_print_scan_config = wlan_print_scan_config;
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -615,6 +615,11 @@ typedef struct ieee80211_rep_move {
+ } ieee80211_rep_move_t;
+ 
+ 
++struct ieee80211_relax_amsdu_conf {
++    void (*update)(struct ieee80211com *ic);
++    int enabled;
++};
++
+ typedef struct ieee80211com {
+     osdev_t                       ic_osdev; /* OS opaque handle */
+     qdf_device_t                  ic_qdf_dev; /* ADF opaque handle */
+@@ -1902,6 +1907,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     int                                 ic_rssi_comb_fix;
+     void                                (*ic_rssi_comb_fix_set)(struct ieee80211com *ic, int enable);
+     int                                 ic_uniform_rssi;
++    struct ieee80211_relax_amsdu_conf   ic_relax_amsdu;
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -1107,6 +1107,7 @@ struct ieee80211_ops {
+     int          (*set_min_rssi)(ieee80211_handle_t ieee, int rssi);
+     int          (*get_min_rssi)(ieee80211_handle_t ieee);
+     void         (*update_ack_rssi)(ieee80211_node_t node, int rssi);
++    void         (*flush_amsdu)(ieee80211_handle_t, int qnum);
+ };
+ 
+ /**
+--- a/lmac/ath_dev/ath_internal.h
++++ b/lmac/ath_dev/ath_internal.h
+@@ -2074,6 +2074,7 @@ struct ath_softc {
+     u_int32_t sc_3wire_bt_coex_enable;
+ #endif
+     atomic_t                sc_hwif_stop_refcnt;/*atomic variable to check if HW Stop in Progress*/
++    unsigned long sc_amsdu_qnum_force;
+ };
+ 
+ typedef enum {
+--- a/lmac/ath_dev/ath_swretry.c
++++ b/lmac/ath_dev/ath_swretry.c
+@@ -126,6 +126,9 @@ ath_handlepspoll(ath_dev_t dev, ath_node
+             if (txq == NULL)
+                 txq = &sc->sc_txq[tid->ac->qnum];
+ 
++            if (sc->sc_ieee_ops->flush_amsdu)
++                sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+                 ATH_TXQ_LOCK(txq);
+                 ath_tx_queue_tid(txq, tid);
+                 ath_txq_schedule(sc, txq);
+--- a/lmac/ath_dev/ath_xmit.c
++++ b/lmac/ath_dev/ath_xmit.c
+@@ -3591,6 +3591,9 @@ ath_tx_processq(struct ath_softc *sc, st
+     int cfendq = 0;
+ #endif
+ 
++    if (sc->sc_ieee_ops->flush_amsdu)
++        sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+     DPRINTF(sc, ATH_DEBUG_TX_PROC, "%s: tx queue %d (%x), link %p\n", __func__,
+             txq->axq_qnum, ath_hal_gettxbuf(sc->sc_ah, txq->axq_qnum),
+             txq->axq_link);
+--- a/lmac/ath_dev/ath_xmit_ht.c
++++ b/lmac/ath_dev/ath_xmit_ht.c
+@@ -423,6 +423,9 @@ ath_tx_resume_tid(struct ath_softc *sc,
+ {
+     struct ath_txq *txq = &sc->sc_txq[tid->ac->qnum];
+ 
++    if (sc->sc_ieee_ops->flush_amsdu)
++        sc->sc_ieee_ops->flush_amsdu(sc->sc_ieee, txq->axq_qnum);
++
+ #ifdef ATH_SWRETRY
+     /*if STA leave and receive the power save of do not do the tid->pause--*/
+     if ((tid->an->an_flags & ATH_NODE_LEAVE)!=ATH_NODE_LEAVE)
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -2158,6 +2158,11 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+         if (ic->ic_rssi_comb_fix_set)
+             ic->ic_rssi_comb_fix_set(ic, value);
+         break;
++    case IEEE80211_PARAM_RELAX_AMSDU:
++        ic->ic_relax_amsdu.enabled = value;
++        if (ic->ic_relax_amsdu.update)
++            ic->ic_relax_amsdu.update(ic);
++        break;
+     case IEEE80211_PARAM_UNIFORM_RSSI:
+         ic->ic_uniform_rssi = value;
+         break;
+@@ -4523,6 +4528,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_RSSI_COMBINED_FIX:
+         *value = ic->ic_rssi_comb_fix;
+         break;
++    case IEEE80211_PARAM_RELAX_AMSDU:
++        *value = ic->ic_relax_amsdu.enabled;
++        break;
+     case IEEE80211_PARAM_UNIFORM_RSSI:
+         *value = ic->ic_uniform_rssi;
+         break;

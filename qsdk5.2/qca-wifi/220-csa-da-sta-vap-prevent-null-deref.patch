@@ -1,0 +1,88 @@
+STA vap has 2 CSA timers and both are disarmed in
+the OL iv_stopping callback. They were however
+not properly disarmed on DA radio. This led to
+kernel panics in some corner cases.
+
+This both adds missing timer disarming as well as
+adds a NULL pointer check where the fault happened
+to prevent it and screams about it (so it can be
+investigated if it still appears in case the fix
+isn't complete).
+
+Kernel complained:
+
+> <1>[ 1574.346866] CPU 0 Unable to handle kernel paging request at virtual address 0000015a, epc == 862124ec, ra == 86257cac
+> <4>[ 1574.346886] Oops[#1]:
+> <4>[ 1574.349239] CPU: 0 PID: 0 Comm: swapper Tainted: P                4.4.60 #212
+> <4>[ 1574.356608] task: 80421318 ti: 8041a000 task.ti: 8041a000
+> <4>[ 1574.362177] $ 0   : 00000000 80470000 00000002 00000000
+> <4>[ 1574.367605] $ 4   : ffffffff 0000001f 86336a78 863208c4
+> <4>[ 1574.373036] $ 8   : 00000000 00000024 00000000 00008058
+> <4>[ 1574.378465] $12   : 00008130 7781a350 00000000 00000000
+> <4>[ 1574.383895] $16   : ffffffff 80420000 86252440 855d8000
+> <4>[ 1574.389325] $20   : 0000ea60 00200000 00000200 00100000
+> <4>[ 1574.394754] $24   : 00000000 801ef938
+> <4>[ 1574.400184] $28   : 8041a000 8041bba8 00000004 86257cac
+> <4>[ 1574.405615] Hi    : 0005da01
+> <4>[ 1574.408589] Lo    : 5ffcfad6
+> <4>[ 1574.412005] epc   : 862124ec IEEE80211_DPRINTF+0x30/0x11c [umac]
+> <4>[ 1574.418652] ra    : 86257cac ieee80211_mlme_recv_csa+0x44/0xfc [umac]
+
+GDB pointed to:
+
+> (gdb) l * ieee80211_beacon_intersect+0x15f8-1
+> 0x5261f is in ieee80211_synced_disconnect_sta (/home/user/src/plume/device/sdk/qsdk52/qsdk/build_dir/target-mips_74kc_uClibc-1.0.14/linux-ar71xx_generic/qca-wifi-10.4-g1528e40-dirty-unified-perf/qca-wifi-10.4-g1528e40-dirty/os/linux/../../umac/mlme/ieee80211_mgmt_sta.c:119).
+> 114
+> 115         OS_GET_TIMER_ARG(vap, struct ieee80211vap *);
+> 116
+> 117         ni = vap->iv_ni;
+> 118
+> 119         ieee80211_mlme_recv_csa(ni, IEEE80211_RADAR_DETECT_DEFAULT_DELAY,true);
+> 120         OS_CANCEL_TIMER(&vap->iv_disconnect_sta_timer);
+> 121     }
+> 122
+> 123     static OS_TIMER_FUNC(ieee80211_synced_channel_switch)
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -2663,6 +2663,22 @@ int ath_vap_stopping(struct ieee80211vap
+     struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
+     struct ath_vap_net80211 *avn = ATH_VAP_NET80211(vap);
+ 
++    switch (ieee80211vap_get_opmode(vap)) {
++        case IEEE80211_M_STA:
++            OS_CANCEL_TIMER(&vap->iv_cswitch_timer);
++            OS_CANCEL_TIMER(&vap->iv_disconnect_sta_timer);
++            /* Cancelling cswitch timer doesn't mean
++             * it was ever run and so the CSA flag may
++             * need clearing.
++             *
++             * Expected usecase is 1 STA VAP + 0..N AP VAPs.
++             */
++            if (ieee80211_num_apvap_running(ic) == 0)
++                ic->ic_flags &= ~IEEE80211_F_CHANSWITCH;
++        default:
++            break;
++    }
++
+ #ifdef ATH_SWRETRY
+     scn->sc_ops->set_swretrystate(scn->sc_dev, ATH_NODE_NET80211(vap->iv_bss)->an_sta, AH_FALSE);
+     DPRINTF(scn, ATH_DEBUG_SWR, "%s: swr disable for ni %s\n", __func__, ether_sprintf(vap->iv_bss->ni_macaddr));
+--- a/umac/mlme/ieee80211_mgmt_sta.c
++++ b/umac/mlme/ieee80211_mgmt_sta.c
+@@ -115,6 +115,8 @@ static OS_TIMER_FUNC(ieee80211_synced_di
+     OS_GET_TIMER_ARG(vap, struct ieee80211vap *);
+ 
+     ni = vap->iv_ni;
++    if (WARN_ON(!ni))
++        return;
+ 
+     ieee80211_mlme_recv_csa(ni, IEEE80211_RADAR_DETECT_DEFAULT_DELAY,true);
+     OS_CANCEL_TIMER(&vap->iv_disconnect_sta_timer);
+@@ -451,6 +453,7 @@ void ieee80211_recv_beacon_sta(struct ie
+                 chan = ieee80211_get_new_sw_chan (ni, chanie, echanie, secchanoff, widebwie, cswarp);
+                 if (chan) {
+                     vap->iv_cswitch_chan = chan;
++                    OS_CANCEL_TIMER(&vap->iv_disconnect_sta_timer);
+                     IEEE80211_DPRINTF_IC(ic, IEEE80211_VERBOSE_NORMAL, IEEE80211_MSG_EXTIOCTL_CHANSWITCH,
+                             "%s: Channel switch announcement received, switching to chan: %d, mode/flags: 0x%x\n",
+                             __func__, chan->ic_ieee,  chan->ic_flags);

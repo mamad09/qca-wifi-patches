@@ -1,0 +1,174 @@
+This adds a new binary subioctl that exports last
+4 beacon rssi values, their age expressed in
+relative number of seconds (capped to 255) and a
+packet counter to allow userspace noticing
+stalls/updates.
+
+All of this is expressed as 3 host-endian
+integers. RSSI value and age are 8-bit wide with
+most recent values in LSB.
+
+This can be used to get fairly stable rssi values
+that don't need compensation. In comparison
+high-rate data packets need compenstation relative
+to their MCS, BW and NSS/STBC.
+
+Normally beacons are expected to come often at a
+fixed rate so the data should be always easily
+available. If it isn't it implies the connection
+is suffering poor conditions and explicit
+measurements make little sense as they may fail
+anyway or tell us what we already know.
+
+Example use:
+
+ root@pir1:~# iwconfig sta1 | grep Access
+           Mode:Managed  Frequency:2.412 GHz  Access Point: D0:05:2A:36:52:9B
+ root@pir1:~# iwpriv sta1 glastbcnrssi $(echo D0:05:2A:36:52:9B | tr ':' '\n' | sed 's/^/0x/') ; sleep 3 ; iwpriv sta1 glastbcnrssi $(echo D0:05:2A:36:52:9B | tr ':' '\n' | sed 's/^/0x/')
+ sta1      glastbcnrssi:59  58  58  59  0  0  0  0  0  0  3  63
+ sta1      glastbcnrssi:59  59  60  58  0  0  0  0  0  0  3  73
+
+Explanation:
+                         these are actually 3 host-endian integers
+                        in this example they are big-endian because
+                         the piranha's host cpu is big-endian MIPS
+                                _____________|____________
+                               /             |            \
+                              |              |            |
+                         _____|______    ____|____    ____|_____
+                        |            |  |         |  |          |
+ sta1      glastbcnrssi:59  58  58  59  0  0  0  0  0  0  3  63
+                        ^^^^^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^
+                              |              |            |
+                     last 4 rssi values      |      sample counter
+                                             |
+                                     last 4 rssi's age
+
+                            the "60" rssi is 0 second old
+                                     ______|_____          ______
+                                    /            \        /  /   \
+                                    |            |       |   |    \     these samples are 3 seconds apart
+ sta1      glastbcnrssi:58  58  59  60  0  0  0  0  0  0  6  27     \__  implying there were 14 beacons received
+ sta1      glastbcnrssi:58  58  60  59  0  0  0  0  0  0  6  41     /    averaging at ~4.6 per second
+                                 |            |          |   |    /     (beacon intval of the AP was set to 200ms so it's close)
+                                 \___________/            \__\___/
+                                       |
+                             the 2nd most recent rssi of "60"
+                             (in measurement 3 seconds later
+                              keep in mind 41-27 counter is > 4 so
+                              rssi have wrapped around already)
+                             is 0 seconds old *in relation*
+                             to the 1st ("59")
+                             this is expected as beacon intveral
+                             tends to be within 100-200ms
+
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1487,6 +1487,7 @@ enum {
+     IEEE80211_PARAM_THERM,
+     IEEE80211_PARAM_CSA_DEAUTH,
+     IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
++    IEEE80211_PARAM_LAST_BCN_RSSI,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14366,6 +14366,9 @@ static const struct iw_priv_args ieee802
+     IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "qutil_intval" },
+     { IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
+     0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_qutil_intval" },
++    { IEEE80211_PARAM_LAST_BCN_RSSI,
++      IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | IEEE80211_ADDR_LEN,
++      IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | 12, "glastbcnrssi" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -569,6 +569,10 @@ typedef struct ieee80211_node {
+     u64 ps_kapi_peer_cookie;
+     struct ps_kapi_peer_rx_stats ps_kapi_peer_rx_stats;
+     struct ps_kapi_peer_tx_stats ps_kapi_peer_tx_stats;
++    unsigned long ni_last_bcn_rssi;
++    unsigned long ni_last_bcn_age;
++    unsigned long ni_last_bcn_cnt;
++    unsigned long ni_last_bcn_jiffies;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 
+--- a/umac/mlme/ieee80211_mgmt.c
++++ b/umac/mlme/ieee80211_mgmt.c
+@@ -2713,6 +2713,25 @@ ieee80211_update_beacon(struct ieee80211
+     return scan_entry;
+ }
+ 
++static void
++ieee80211_mgmt_update_bcn_rssi(struct ieee80211_node *ni, int rssi)
++{
++    unsigned long age;
++
++    if (rssi & 0x80)
++        return;
++
++    age = jiffies - ni->ni_last_bcn_jiffies;
++    age = jiffies_to_msecs(age) / MSEC_PER_SEC;
++    if (age > 0xff)
++        age = 0xff;
++
++    ACCESS_ONCE(ni->ni_last_bcn_rssi) = (ni->ni_last_bcn_rssi << 8) | rssi;
++    ACCESS_ONCE(ni->ni_last_bcn_age) = (ni->ni_last_bcn_age << 8) | age;
++    ACCESS_ONCE(ni->ni_last_bcn_jiffies) = jiffies;
++    ACCESS_ONCE(ni->ni_last_bcn_cnt) = ni->ni_last_bcn_cnt + 1;
++}
++
+ static int
+ ieee80211_recv_beacon(struct ieee80211_node *ni, wbuf_t wbuf, int subtype, struct ieee80211_rx_status *rs)
+ {
+@@ -2723,6 +2742,8 @@ ieee80211_recv_beacon(struct ieee80211_n
+     u_int8_t nullbssid[IEEE80211_ADDR_LEN] = {0x00,0x00,0x00,0x00,0x00,0x00};
+     struct ieee80211_mlme_priv                   *mlme_priv = vap->iv_mlme_priv;
+ 
++    ieee80211_mgmt_update_bcn_rssi(ni, rs->rs_rssi);
++
+     wh = (struct ieee80211_frame *)wbuf_header(wbuf);
+     if((IEEE80211_FC0_SUBTYPE_BEACON == subtype) && (unlikely(!IEEE80211_IS_BROADCAST(wh->i_addr1))))
+         return EOK;
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -4384,6 +4384,35 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+     case IEEE80211_PARAM_CSA_DEAUTH:
+         *value = vap->iv_csa_deauth;
+         break;
++    case IEEE80211_PARAM_LAST_BCN_RSSI:
++    {
++        struct ieee80211_node *ni;
++        char addr[IEEE80211_ADDR_LEN];
++        unsigned long age;
++        int i;
++
++        for (i = 0; i < sizeof(addr); i++)
++            addr[i] = extra[4 + i];
++
++        ni = ieee80211_find_node(&ic->ic_sta, addr);
++        if (ni) {
++            age = jiffies - ACCESS_ONCE(ni->ni_last_bcn_jiffies);
++            age = jiffies_to_msecs(age) / MSEC_PER_SEC;
++            if (age > 0xff)
++                age = 0xff;
++
++            value[0] = ACCESS_ONCE(ni->ni_last_bcn_rssi);
++            value[1] = ACCESS_ONCE(ni->ni_last_bcn_age);
++            value[1] <<= 8;
++            value[1] |= age;
++            value[2] = ACCESS_ONCE(ni->ni_last_bcn_cnt);
++            ieee80211_free_node(ni);
++            retv = 0;
++        } else {
++            retv = -ENOENT;
++        }
++        break;
++    }
+     case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
+         *value = ic->ic_poll_q_util_interval_ms;
+         break;

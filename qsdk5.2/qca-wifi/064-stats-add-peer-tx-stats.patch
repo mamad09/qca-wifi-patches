@@ -1,0 +1,867 @@
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -9,6 +9,7 @@ struct ieee80211com;
+ struct ieee80211_node;
+ struct ieee80211_channel;
+ struct _ieee80211_scan_event;
++struct ath_rc_series;
+ 
+ struct ps_kapi_cc {
+ 	u64 total;
+@@ -57,6 +58,14 @@ struct ps_kapi_peer_rx_stats {
+ 	} stats[PS_MAX_ALL];
+ };
+ 
++struct ps_kapi_peer_tx_stats {
++	struct {
++		u32 attempts;
++		u32 success;
++		u32 ppdus;
++	} stats[PS_MAX_ALL];
++};
++
+ void ps_kapi_cc_update(struct ieee80211com *ic);
+ void ps_kapi_handle_scan(struct ieee80211com *ic,
+ 			 struct _ieee80211_scan_event *event);
+@@ -67,5 +76,17 @@ int ps_kapi_ioctl(struct net_device *dev
+ 		  char *extra);
+ void ps_kapi_peer_init(struct ieee80211com *ic,
+ 		       struct ieee80211_node *ni);
++void ps_kapi_peer_tx_stats_collect_ar900x(struct ieee80211com *ic,
++					  struct ieee80211_node *ni,
++					  struct ath_rc_series *rcs,
++					  int longretry,
++					  int shortretry,
++					  int rateindex,
++					  int num_frames,
++					  int num_bad);
++void ps_kapi_peer_tx_stats_collect_ar98xx(struct ieee80211com *ic,
++					  struct ieee80211_node *ni,
++					  u32 *ppdu_start,
++					  u32 *ppdu_end);
+ 
+ #endif
+--- a/lmac/ath_dev/ath_edma_xmit.c
++++ b/lmac/ath_dev/ath_edma_xmit.c
+@@ -293,6 +293,14 @@ ath_tx_edma_process(ath_dev_t dev)
+ 
+                 if (bf->bf_isdata && !noratectrl &&
+                             likely(!bf->bf_useminrate)) {
++                    ps_kapi_peer_tx_stats_collect_ar900x(sc->sc_ieee,
++                                                         an->an_node,
++                                                         bf->bf_rcs,
++                                                         ts.ts_longretry,
++                                                         ts.ts_shortretry,
++                                                         ts.ts_rateindex,
++                                                         bf->bf_nframes,
++                                                         ath_tx_num_badfrms(sc, bf, &ts, txok));
+ #ifdef ATH_SUPPORT_VOWEXT
+                     /* FIXME do not care Ospre related issues as on today, keep
+                        this pending until we get to that
+--- a/lmac/ath_dev/ath_xmit.c
++++ b/lmac/ath_dev/ath_xmit.c
+@@ -3824,9 +3824,20 @@ ath_tx_processq(struct ath_softc *sc, st
+                     nacked++;
+ 
+                 if (bf->bf_isdata && !noratectrl && likely(!bf->bf_useminrate)) {
++                    struct ath_desc *ps_ds;
+ 					if (isrifs)
+ 						OS_SYNC_SINGLE(sc->sc_osdev, bf->bf_rifslast->bf_daddr,
+ 										sc->sc_txdesclen, BUS_DMA_FROMDEVICE, NULL);
++
++                    ps_ds = (isrifs ? bf->bf_rifslast->bf_desc : ds);
++                    ps_kapi_peer_tx_stats_collect_ar900x(sc->sc_ieee,
++                                                         an->an_node,
++                                                         bf->bf_rcs,
++                                                         ps_ds->ds_txstat.ts_longretry,
++                                                         ps_ds->ds_txstat.ts_shortretry,
++                                                         ps_ds->ds_txstat.ts_rateindex,
++                                                         bf->bf_nframes,
++                                                         ath_tx_num_badfrms(sc, bf, &ps_ds->ds_txstat, txok));
+ #if ATH_SUPPORT_VOWEXT
+                     ath_rate_tx_complete(sc, an,
+                                          isrifs ? bf->bf_rifslast->bf_desc : ds,
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -12,6 +12,7 @@
+ #include <ps_uapi.h>
+ #include <ps_kapi.h>
+ #include <ieee80211_var.h>
++#include <if_athrate.h>
+ #define HW_REG_ASLEEP 0xdeadbeef
+ 
+ /*
+@@ -32,6 +33,13 @@
+ # define lockdep_assert_held(x)
+ #endif
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,3,0)
++static inline __u64 rol64(__u64 word, unsigned int shift)
++{
++	return (word << shift) | (word >> (64 - shift));
++}
++#endif
++
+ static void __ps_kapi_cc_update(struct ieee80211com *ic)
+ {
+ 	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
+@@ -444,6 +452,59 @@ skip:
+ 	return err;
+ }
+ 
++static int ps_kapi_ioctl_get_peer_tx_stats(struct net_device *dev,
++					   struct iw_request_info *info,
++					   union iwreq_data *wrqu,
++					   char *extra,
++					   struct ps_uapi_ioctl *cmd)
++{
++	struct ieee80211com *ic;
++	struct ieee80211_node *ni;
++	struct ieee80211_node_table *nt;
++	struct ps_kapi_ctx *ctx;
++	struct ps_kapi_peer_tx_stats *src;
++	unsigned long flags;
++	unsigned long flags2;
++	rwlock_state_t lock_state;
++	int err;
++	int i;
++
++	ic = ath_netdev_priv(dev);
++	nt = &ic->ic_sta;
++	ctx = &ic->ps_kapi_ctx;
++
++	OS_BEACON_WRITE_LOCK(&nt->nt_nodelock, &lock_state, flags);
++
++	ni = ps_kapi_find_node(nt, cmd->u.peer_tx_stats.set.addr);
++	if (!ni) {
++		err = -ENOENT;
++		goto unlock;
++	}
++
++	src = &ni->ps_kapi_peer_tx_stats;
++
++	BUILD_BUG_ON(ARRAY_SIZE(cmd->u.peer_tx_stats.get.stats) !=
++		     ARRAY_SIZE(src->stats));
++
++	memset(&cmd->u.peer_tx_stats.get, 0, sizeof(cmd->u.peer_tx_stats.get));
++
++	cmd->u.peer_tx_stats.get.cookie = ni->ps_kapi_peer_cookie;
++
++	spin_lock_irqsave(&ctx->lock, flags2);
++	for (i = 0; i < ARRAY_SIZE(src->stats); i++) {
++		cmd->u.peer_tx_stats.get.stats[i].attempts = src->stats[i].attempts;
++		cmd->u.peer_tx_stats.get.stats[i].success = src->stats[i].success;
++		cmd->u.peer_tx_stats.get.stats[i].ppdus = src->stats[i].ppdus;
++	}
++	spin_unlock_irqrestore(&ctx->lock, flags2);
++
++	err = 0;
++
++unlock:
++	OS_BEACON_WRITE_UNLOCK(&nt->nt_nodelock, &lock_state, flags);
++
++	return err;
++}
+ 
+ static int ps_kapi_ioctl_get_q_util(struct net_device *dev,
+ 				    struct iw_request_info *info,
+@@ -478,6 +539,7 @@ static const ps_kapi_ioctl_op get_ops[PS
+ 	[PS_UAPI_IOCTL_CMD_PEER_RX_STATS] = ps_kapi_ioctl_get_peer_rx_stats,
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_CHAN] = ps_kapi_ioctl_get_survey_chan,
+ 	[PS_UAPI_IOCTL_CMD_SURVEY_BSS] = ps_kapi_ioctl_get_survey_bss,
++	[PS_UAPI_IOCTL_CMD_PEER_TX_STATS] = ps_kapi_ioctl_get_peer_tx_stats,
+ 	[PS_UAPI_IOCTL_CMD_Q_UTIL] = ps_kapi_ioctl_get_q_util,
+ };
+ 
+@@ -549,3 +611,290 @@ void ps_kapi_peer_init(struct ieee80211c
+ }
+ EXPORT_SYMBOL(ps_kapi_peer_init);
+ 
++static void __ps_kapi_peer_tx_stats_collect(struct ieee80211com *ic,
++					    struct ieee80211_node *ni,
++					    u32 rix,
++					    u32 attempts,
++					    u32 success,
++					    u32 ppdus)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++
++	lockdep_assert_held(&ctx->lock);
++
++	ni->ps_kapi_peer_tx_stats.stats[rix].attempts += attempts;
++	ni->ps_kapi_peer_tx_stats.stats[rix].success += success;
++	ni->ps_kapi_peer_tx_stats.stats[rix].ppdus += ppdus;
++}
++
++static u32 ps_kapi_calc_tx_rix_ar900x(int rix, bool ht40)
++{
++	struct ps_cmn_rate_info ri = {};
++
++	/* 0..3 - CCK
++	 * 4..11 - OFDM
++	 * 12+ - HT
++	 */
++	if (rix < 4) {
++		ri.is_cck = 1;
++		ri.mcs = rix;
++	} else if (rix < 12) {
++		ri.mcs = rix - 4;
++	} else {
++		ri.is_ht = 1;
++		ri.mcs = rix - 12;
++		ri.nss = ri.mcs / 8;
++		ri.mcs = ri.mcs % 8;
++		ri.bw = ht40 ? 1 : 0;
++	}
++
++	return ps_cmn_calc_rix(&ri);
++}
++
++void ps_kapi_peer_tx_stats_collect_ar900x(struct ieee80211com *ic,
++					  struct ieee80211_node *ni,
++					  struct ath_rc_series *rcs,
++					  int longretry,
++					  int shortretry,
++					  int rateindex,
++					  int num_frames,
++					  int num_bad)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	unsigned long flags;
++	u32 rix;
++	u32 attempts;
++	u32 success;
++	bool ht40;
++	int retry;
++	int i;
++
++	spin_lock_irqsave(&ctx->lock, flags);
++
++	retry = longretry;
++
++	for (i = 0; i < rateindex; i++) {
++		ht40 = rcs[i].flags & ATH_RC_CW40_FLAG;
++		rix = ps_kapi_calc_tx_rix_ar900x(rcs[i].rix, ht40);
++		attempts = rcs[i].tries * num_frames;
++		success = 0;
++
++		__ps_kapi_peer_tx_stats_collect(ic, ni, rix, attempts, success, rcs[i].tries);
++	}
++
++	ht40 = rcs[rateindex].flags & ATH_RC_CW40_FLAG;
++	rix = ps_kapi_calc_tx_rix_ar900x(rcs[rateindex].rix, ht40);
++	attempts = (retry + 1) * num_frames;
++	success = num_frames - num_bad;
++
++	__ps_kapi_peer_tx_stats_collect(ic, ni, rix, attempts, success, retry+1);
++
++	spin_unlock_irqrestore(&ctx->lock, flags);
++}
++EXPORT_SYMBOL(ps_kapi_peer_tx_stats_collect_ar900x);
++
++static int ps_kapi_calc_tx_rix_ar98xx(u32 rate, u32 bw)
++{
++	struct ps_cmn_rate_info ri = {};
++	static const u32 ofdm_map[] = {
++		[0] = 6,
++		[1] = 4,
++		[2] = 2,
++		[3] = 0,
++		[4] = 7,
++		[5] = 5,
++		[6] = 3,
++		[7] = 1,
++	};
++	static const u32 cck_map[] = {
++		[0] = 11,
++		[1] = 10,
++		[2] = 9,
++		[3] = 8,
++		[4] = 14,
++		[5] = 13,
++		[6] = 12,
++	};
++	u32 mcs;
++	u32 nss;
++	u32 preamble;
++
++	mcs = (rate >> 24) & 0xf;
++	nss = (rate >> 28) & 0x3;
++	preamble = (rate >> 30) & 0x3;
++
++	switch (preamble) {
++	case 0:
++		ri.mcs = ofdm_map[mcs];
++		break;
++	case 1:
++		ri.is_cck = 1;
++		ri.mcs = cck_map[mcs];
++		break;
++	case 2:
++	case 3:
++		ri.is_ht = 1;
++		ri.mcs = mcs;
++		ri.nss = nss;
++		ri.bw = bw;
++		break;
++	}
++
++	return ps_cmn_calc_rix(&ri);
++}
++
++static int ps_kapi_calc_tx_acks_ar98xx(const u32 *ppdu_start,
++				       const u32 *ppdu_end,
++				       u32 idx)
++{
++	u32 seqstart;
++	u32 ackstart;
++	u64 seqmap;
++	u64 ackmap;
++	int seqdelta;
++
++	seqstart = ppdu_start[2];
++	seqstart >>= 0;
++	seqstart &= BIT(12) - 1;
++
++	seqmap = ppdu_start[4];
++	seqmap <<= 32;
++	seqmap |= ppdu_start[3];
++
++	ackstart = ppdu_end[16 + 0];
++	ackstart >>= 0;
++	ackstart &= BIT(12) - 1;
++
++	ackmap = ppdu_end[16 + 2];
++	ackmap <<= 32;
++	ackmap |= ppdu_end[16 + 1];
++
++	seqdelta = ackstart - seqstart;
++
++	if (seqdelta < 0)
++		seqdelta += 64;
++
++	if (seqdelta >= 64)
++		return 0;
++
++	ackmap = rol64(ackmap, seqdelta);
++	ackmap &= seqmap;
++
++	return hweight64(ackmap);
++}
++
++static int ps_kapi_get_rate_ar98xx(const u32 *ppdu_start,
++				   const u32 *ppdu_end,
++				   int try,
++				   u32 *idx,
++				   u32 *rate,
++				   u32 *bw,
++				   u32 *attempts)
++{
++	bool is_rts;
++	bool is_packet;
++	u32 series;
++	u32 bw_rts;
++	u32 bw_packet;
++
++	is_rts = !!(ppdu_end[try] & BIT(30));
++	is_packet = !!(ppdu_end[try] & BIT(31));
++	bw_rts = (ppdu_end[try] >> 26) & 0x3;
++	bw_packet = (ppdu_end[try] >> 28) & 0x3;
++	series = (ppdu_end[try] >> 24) & 0x1;
++	if (is_packet) {
++		*bw = bw_packet;
++	} else if (is_rts) {
++		return -1;
++	} else {
++		return -1;
++	}
++
++	*idx = (series * 4) + (*bw);
++	*rate = ppdu_start[21 + ((*idx) * 4) + 1];
++	*attempts = is_packet;
++
++	/* I'm not sure if this is practically possible but the data
++	 * structure doesn't prevent this. If it happens it makes it
++	 * ambiguous which rate gets success count for the final rate.
++	 * Just put a warning dump for now so - if it ever happens
++	 * someone will notice and complain. I've ran some traffic and
++	 * wasn't able to hit != bw.
++	 */
++	WARN_ON_ONCE(unlikely(bw_rts != bw_packet));
++
++	return 0;
++}
++
++void ps_kapi_peer_tx_stats_collect_ar98xx(struct ieee80211com *ic,
++					  struct ieee80211_node *ni,
++					  u32 *ppdu_start,
++					  u32 *ppdu_end)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++	unsigned long flags;
++	int try;
++	int rix;
++	int err;
++	bool is_tx_ok;
++	bool is_ampdu;
++	bool is_noack;
++	bool is_last;
++	u32 num_tries;
++	u32 bw;
++	u32 idx;
++	u32 rate;
++	u32 attempts;
++	u32 success;
++
++	is_tx_ok = !!(ppdu_end[16] & BIT(31));
++	is_ampdu = !!(ppdu_start[13] & BIT(15));
++	is_noack = !!(ppdu_start[13] & BIT(16));
++	num_tries = (ppdu_end[16 + 11] >> 24) & 0x1f;
++	num_tries = min(num_tries, 16U);
++
++	spin_lock_irqsave(&ctx->lock, flags);
++
++	if (is_noack)
++		goto unlock;
++
++	if (num_tries == 0)
++		goto unlock;
++
++	for (try = 0; try < num_tries; try++) {
++		err = ps_kapi_get_rate_ar98xx(ppdu_start,
++					      ppdu_end,
++					      try,
++					      &idx,
++					      &rate,
++					      &bw,
++					      &attempts);
++		if (err)
++			continue;
++
++		rix = ps_kapi_calc_tx_rix_ar98xx(rate, bw);
++		success = 0;
++		is_last = !!(try == (num_tries - 1));
++
++		if (is_ampdu) {
++			attempts *= hweight32(ppdu_start[3]) +
++				    hweight32(ppdu_start[4]);
++
++			if (is_last && is_tx_ok)
++				success = ps_kapi_calc_tx_acks_ar98xx(ppdu_start,
++								      ppdu_end,
++								      idx);
++		} else {
++			attempts *= 1;
++
++			if (is_last && is_tx_ok)
++				success = 1;
++		}
++
++		__ps_kapi_peer_tx_stats_collect(ic, ni, rix, attempts, success, 1);
++	}
++
++unlock:
++	spin_unlock_irqrestore(&ctx->lock, flags);
++}
++EXPORT_SYMBOL(ps_kapi_peer_tx_stats_collect_ar98xx);
+--- a/offload/wlan/include/ol_if_athvar.h
++++ b/offload/wlan/include/ol_if_athvar.h
+@@ -741,6 +741,9 @@ struct ol_ath_softc_net80211 {
+    int                      therm;
+    os_timer_t               therm_poll_timer;
+    u_int32_t                therm_poll_interval;
++   wdi_event_subscribe      ps_event_sub;
++   bool                     ps_txstat_discard;
++   u_int32_t                ps_txstat_ppdu_end[32];
+ };
+ #define OL_ATH_DCS_ENABLE(__arg1, val) ((__arg1) |= (val))
+ #define OL_ATH_DCS_DISABLE(__arg1, val) ((__arg1) &= ~(val))
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -97,6 +97,12 @@
+ #if ATH_PERF_PWR_OFFLOAD
+ 
+ #include "ath_pci.h"
++
++#include <linux/average.h>
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
++
+ #include <linux/fs.h>
+ #include <linux/gpio.h>
+ #ifndef __LINUX_POWERPC_ARCH__
+@@ -8048,6 +8054,36 @@ OS_TIMER_FUNC(ol_ath_therm_poll_timer)
+ }
+ 
+ int
++ol_ps_txstat_start(struct ol_ath_softc_net80211 *scn)
++{
++    wmi_buf_t buf;
++    wmi_pdev_pktlog_enable_cmd *cmd;
++    int len;
++    int err;
++
++    len = sizeof(wmi_pdev_pktlog_enable_cmd);
++    buf = wmi_buf_alloc(scn->wmi_handle, len);
++    if (!buf) {
++        qdf_print("%s: wmi_buf_alloc() failed\n", __func__);
++        return A_ERROR;
++    }
++
++    cmd = (wmi_pdev_pktlog_enable_cmd *)wmi_buf_data(buf);
++    cmd->evlist = WMI_PKTLOG_EVENT_TX;
++
++    err = wmi_unified_cmd_send(scn->wmi_handle,
++                               buf,
++                               len,
++                               WMI_PDEV_PKTLOG_ENABLE_CMDID);
++    if (err) {
++        qdf_print("%s: wmi_unified_cmd_send() failed: %d\n", __func__, err);
++        return A_ERROR;
++    }
++
++    return A_OK;
++}
++
++int
+ ol_ath_attach(u_int16_t devid, struct ol_ath_softc_net80211 *scn,
+               IEEE80211_REG_PARAMETERS *ieee80211_conf_parm,
+               ol_ath_update_fw_config_cb cfg_cb)
+@@ -8528,6 +8564,11 @@ ol_ath_attach(u_int16_t devid, struct ol
+ #ifdef QCA_NSS_WIFI_OFFLOAD_SUPPORT
+     osif_nss_ol_wifi_monitor_set_filter(ic, MON_FILTER_ALL_DISABLE);
+ #endif
++
++    status = ol_ps_txstat_start(scn);
++    if (status != EOK)
++        printk("ps: failed to start txstat: %d\n", status);
++
+     return EOK;
+ 
+ attach_failed:
+--- a/offload/wlan/txrx/ol_txrx.c
++++ b/offload/wlan/txrx/ol_txrx.c
+@@ -47,6 +47,7 @@
+ #include <ol_rx_pn.h>          /* ol_rx_pn_check, etc. */
+ #include <ol_rx_fwd.h>         /* ol_rx_fwd_check, etc. */
+ #include <ol_tx_desc.h>        /* ol_tx_desc_frame_free */
++#include <ol_txrx.h>
+ #include <wdi_event.h>         /* WDI events */
+ #include <ol_ratectrl_11ac_if.h>    /* attaching/freeing rate-control contexts */
+ #if QCA_OL_TX_CACHEDHDR
+@@ -249,6 +250,82 @@ ol_txrx_mempools_attach(ol_pdev_handle c
+     return 0;
+ }
+ 
++void
++ol_ps_event_sub(void *pdev,
++                enum WDI_EVENT event,
++                void *ptr,
++                u_int16_t peer_id,
++                enum htt_rx_status status)
++{
++    struct ol_txrx_pdev_t *txrx_pdev;
++    struct ol_ath_softc_net80211 *scn;
++    struct ol_txrx_peer_t *peer;
++    struct ieee80211com *ic;
++    struct ieee80211vap *vap;
++    struct ieee80211_node *ni;
++    int log_type;
++    u32 *hdr;
++    u32 *msg;
++
++    if (!pdev)
++        return;
++
++    txrx_pdev = pdev;
++    scn = (void *)txrx_pdev->ctrl_pdev;
++    ic = &scn->sc_ic;
++    hdr = ptr;
++    msg = ptr + (2 + 2 + 2 + 2 + 4 + 4);
++    log_type = hdr[1] & 0xffff;
++
++    /* The possible order is: 3, 2, 8, 4, 1.
++     * This means ppdu start is delivered after ppdu end implying ppdu end has
++     * to be cached in driver struct for rate decoding.
++     */
++
++    switch (log_type) {
++    case 1: /* TX_CTRL, ppdu start */
++        if (scn->ps_txstat_discard)
++            break;
++
++        peer = ol_txrx_get_peer_by_id(txrx_pdev, msg[1]);
++        if (!peer)
++            break;
++
++        if (!peer->vdev)
++            goto unref_peer;
++
++        vap = ol_ath_vap_get(scn, peer->vdev->vdev_id);
++        if (!vap)
++            goto unref_peer;
++
++        ni = ieee80211_vap_find_node(vap, peer->mac_addr.raw);
++        if (!ni)
++            goto unref_peer;
++
++        ps_kapi_peer_tx_stats_collect_ar98xx(ic,
++                ni,
++                msg,
++                scn->ps_txstat_ppdu_end);
++
++        ieee80211_free_node(ni);
++
++unref_peer:
++        ol_txrx_peer_unref_delete(peer);
++        break;
++    case 2: /* TX_STAT, ppdu_end */
++        scn->ps_txstat_discard = 0;
++        memcpy(scn->ps_txstat_ppdu_end, msg,
++               sizeof(scn->ps_txstat_ppdu_end));
++        break;
++    case 4: /* TX_FRM_HDR, means local fw frame */
++    case 8: /* TX_VIRT_ADDR, means local fw frame */
++        scn->ps_txstat_discard = 1;
++        break;
++    }
++
++    return;
++}
++
+ ol_txrx_pdev_handle
+ ol_txrx_pdev_attach(
+     ol_pdev_handle ctrl_pdev,
+@@ -560,6 +637,12 @@ ol_txrx_pdev_attach(
+         qdf_print("WDI event attach unsuccessful\n");
+     }
+ 
++    memset(&scn->ps_event_sub, 0, sizeof(scn->ps_event_sub));
++    scn->ps_event_sub.callback = ol_ps_event_sub;
++    ret = wdi_event_sub(pdev, &scn->ps_event_sub, WDI_EVENT_OFFLOAD_ALL);
++    if (ret)
++        qdf_print("ps: failed to subscribe to WDI_EVENT_OFFLOAD_ALL: %d\n", ret);
++
+     /*
+      * pktlog pdev initialization
+      */
+@@ -614,6 +697,14 @@ ol_txrx_pdev_attach(
+ 
+     return pdev; /* success */
+ 
++#if 0
++    /* This is kept in case it is rebased on and a
++     * cleanup needs to be handled
++     */
++fail8:
++    wdi_event_unsub(pdev, &scn->ps_event_sub, WDI_EVENT_OFFLOAD_ALL);
++#endif
++
+ fail7:
+     OL_RX_REORDER_TRACE_DETACH(pdev);
+ 
+@@ -665,6 +756,8 @@ ol_txrx_pdev_detach(ol_txrx_pdev_handle
+ {
+     int i;
+     A_STATUS ret;
++    struct ol_ath_softc_net80211 *scn;
++
+     /* preconditions */
+     TXRX_ASSERT2(pdev);
+ 
+@@ -687,6 +780,9 @@ ol_txrx_pdev_detach(ol_txrx_pdev_handle
+         ol_txrx_peer_find_hash_erase(pdev);
+     }
+ 
++    scn = (struct ol_ath_softc_net80211 *)pdev->ctrl_pdev;
++    wdi_event_unsub(pdev, &scn->ps_event_sub, WDI_EVENT_OFFLOAD_ALL);
++
+ #if PEER_FLOW_CONTROL
+     pdev->pflow_cong_ctrl_timer_interval = 0;
+     qdf_timer_stop(&pdev->pflow_ctl_cong_timer);
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -549,6 +549,7 @@ ath_tx_complete_aggr_rifs_aponly(struct
+ #endif
+ 
+     TAILQ_INIT(&bf_pending);
++    ath_hal_gettxratecode(sc->sc_ah, bf->bf_desc, (void *)&ts);
+ 
+ #ifdef ATH_RIFS
+     while (bf && bf->bf_rifsburst_elem != ATH_RIFS_BAR)
+@@ -1154,10 +1155,21 @@ ath_tx_processq_aponly(struct ath_softc
+                     nacked++;
+ 
+                 if (likely(bf->bf_isdata && !noratectrl && !bf->bf_useminrate)) {
++                    struct ath_desc *ps_ds;
++
+ 					if (isrifs)
+ 				        OS_SYNC_SINGLE(sc->sc_osdev, bf->bf_rifslast->bf_daddr,
+ 						        sc->sc_txdesclen, BUS_DMA_FROMDEVICE, NULL);
+ 
++                    ps_ds = (isrifs ? bf->bf_rifslast->bf_desc : ds);
++                    ps_kapi_peer_tx_stats_collect_ar900x(sc->sc_ieee,
++                                                         an->an_node,
++                                                         bf->bf_rcs,
++                                                         ps_ds->ds_txstat.ts_longretry,
++                                                         ps_ds->ds_txstat.ts_shortretry,
++                                                         ps_ds->ds_txstat.ts_rateindex,
++                                                         bf->bf_nframes,
++                                                         ath_tx_num_badfrms(sc, bf, &ps_ds->ds_txstat, txok));
+ #if ATH_SUPPORT_VOWEXT
+                     ath_rate_tx_complete(sc, an,
+                                          isrifs ? bf->bf_rifslast->bf_desc : ds,
+@@ -1999,6 +2011,14 @@ ath_tx_edma_tasklet_compact(ath_dev_t de
+                         (bf->bf_flags & HAL_TXDESC_NOACK) == 0)){
+ 
+                 if (likely(bf->bf_isdata && !bf->bf_useminrate && !noratectrl)) {
++                    ps_kapi_peer_tx_stats_collect_ar900x(sc->sc_ieee,
++                                                         an->an_node,
++                                                         bf->bf_rcs,
++                                                         ts.ts_longretry,
++                                                         ts.ts_shortretry,
++                                                         ts.ts_rateindex,
++                                                         bf->bf_nframes,
++                                                         ath_tx_num_badfrms(sc, bf, &ts, txok));
+ #if ATH_SUPPORT_VOWEXT
+                     /* FIXME do not care Ospre related issues as on today, keep
+                        this pending until we get to that
+@@ -2364,6 +2384,14 @@ ath_tx_edma_tasklet_aponly(ath_dev_t dev
+                     nacked++;
+ 
+                 if (likely(bf->bf_isdata && !bf->bf_useminrate)) {
++                    ps_kapi_peer_tx_stats_collect_ar900x(sc->sc_ieee,
++                                                         an->an_node,
++                                                         bf->bf_rcs,
++                                                         ts.ts_longretry,
++                                                         ts.ts_shortretry,
++                                                         ts.ts_rateindex,
++                                                         bf->bf_nframes,
++                                                         ath_tx_num_badfrms(sc, bf, &ts, txok));
+ #ifdef ATH_SUPPORT_VOWEXT
+ 
+                     /* FIXME do not care Ospre related issues as on today, keep
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -568,6 +568,7 @@ typedef struct ieee80211_node {
+ #endif
+     u64 ps_kapi_peer_cookie;
+     struct ps_kapi_peer_rx_stats ps_kapi_peer_rx_stats;
++    struct ps_kapi_peer_tx_stats ps_kapi_peer_tx_stats;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 
+--- a/offload/wlan/lmac_offload_if/ol_if_stats.c
++++ b/offload/wlan/lmac_offload_if/ol_if_stats.c
+@@ -2028,6 +2028,101 @@ void ol_vap_txdiscard_stats_update(void
+     }
+ }
+ 
++/* This is wave2 (beeliner, dakota, cascade) compatible only */
++static void
++ol_if_stats_collect_plume_tx_stats(struct ieee80211com *ic,
++                                   struct ieee80211_node *ni,
++                                   ppdu_common_stats_v3 *in,
++                                   int version)
++{
++    static const unsigned char ofdm2rix[] = {
++        [0] = 6, /* 48 mbps */
++        [1] = 4, /* 24 mbps */
++        [2] = 2, /* 12 mbps */
++        [3] = 0, /* 6 mbps */
++        [4] = 7, /* 54 mbps */
++        [5] = 5, /* 36 mbps */
++        [6] = 3, /* 18mbps */
++        [7] = 1, /* 9 mbps */
++    };
++    static const unsigned char cck2rix[] = {
++        [0] = 3, /* 11 mbps (long) */
++        [1] = 2, /* 5.5 mbps (long) */
++        [2] = 1, /* 2 mbps (long) */
++        [3] = 0, /* 1 mbps (long) */
++        [4] = 6, /* 11 mbps (short) */
++        [5] = 5, /* 5 mbps (short) */
++        [6] = 4, /* 2 mbps (short) */
++    };
++    struct ps_cmn_rate_info ri = {};
++    int preamble;
++    int nss;
++    int mcs;
++    int attempts;
++    int success;
++    int ppdus;
++    int rix;
++    u32 long_retries;
++    u32 mpdus_tried;
++    u32 mpdus_failed;
++    u32 is_aggregate;
++    u32 tx_status;
++    u32 bw_idx;
++    u32 rate;
++
++    if (version < 1)
++        return;
++
++    rate = HTT_T2H_EN_STATS_RATE_GET(in);
++
++    /* Undocumented. It'd end up with mcs=15 which is nonsense so ignore this
++     * report altogether.
++     */
++    if (rate == 0xff)
++        return;
++
++    long_retries = HTT_T2H_EN_STATS_LONG_RETRIES_GET(in);
++    mpdus_tried = HTT_T2H_EN_STATS_MPDUS_TRIED_GET(in);
++    mpdus_failed = HTT_T2H_EN_STATS_MPDUS_FAILED_GET(in);
++    is_aggregate = HTT_T2H_EN_STATS_IS_AGGREGATE_GET(in);
++    tx_status = HTT_T2H_EN_STATS_TX_STATUS_GET(in);
++    bw_idx = HTT_T2H_EN_STATS_BW_IDX_GET(in);
++
++    preamble = (rate >> 6) & 0x3;
++    nss = (rate >> 4) & 0x3;
++    mcs = (rate >> 0) & 0xf;
++
++    switch (preamble) {
++    case 0:
++        ri.mcs = ofdm2rix[mcs % ARRAY_SIZE(ofdm2rix)];
++        break;
++    case 1:
++        ri.is_cck = 1;
++        ri.mcs = cck2rix[mcs % ARRAY_SIZE(cck2rix)];
++        break;
++    case 2:
++    case 3:
++        ri.is_ht = 1;
++        ri.mcs = mcs;
++        ri.nss = nss;
++        ri.bw = bw_idx;
++        break;
++    }
++
++    rix = ps_cmn_calc_rix(&ri);
++
++    ppdus = long_retries + 1;
++    attempts = ppdus * mpdus_tried;
++    success = mpdus_tried - mpdus_failed;
++
++    if (!is_aggregate && tx_status == 0)
++        success = 1;
++
++    ni->ps_kapi_peer_tx_stats.stats[rix].attempts += attempts;
++    ni->ps_kapi_peer_tx_stats.stats[rix].success += success;
++    ni->ps_kapi_peer_tx_stats.stats[rix].ppdus += ppdus;
++}
++
+ #if ENHANCED_STATS
+ #define PPDU_STATS_TX_ERROR_MASK 0xFEC
+ int ol_ath_enh_stats_handler(struct ol_txrx_pdev_t *txrx_pdev, uint32_t* msg_word, uint32_t msg_len)
+@@ -2173,6 +2268,8 @@ int ol_ath_enh_stats_handler(struct ol_t
+             peer->peer_data_stats.discard_cnt = 0;
+             /* */
+ 
++            ol_if_stats_collect_plume_tx_stats(ic, ni, ppdu_stats, ts->version);
++
+             if (peer->bss_peer) {
+                 ni->ni_stats.ns_tx_mcast += num_msdus;
+ #if UMAC_SUPPORT_STA_STATS_ENHANCEMENT

@@ -1,0 +1,29 @@
+--- a/umac/acs/ieee80211_acs.c
++++ b/umac/acs/ieee80211_acs.c
+@@ -1405,7 +1405,7 @@ ieee80211_mark_ht40intol(void *arg, wlan
+         if ( ochk->extchan == sechan){
+             eacs_trace(EACS_DBG_OBSS,("Found Scan entry on Ext chan %d   marking overlap detected for Chan %d  \n",
+                         ochk->extchan, ieee80211_chan2ieee(acs->acs_ic, channel)));
+-            channel->ic_flags |= IEEE80211_CHAN_HT40INTOL;
++            //channel->ic_flags |= IEEE80211_CHAN_HT40INTOL;
+         }
+     }else{
+         /* In case of primary channel we should not consider for OBSS */
+@@ -1420,7 +1420,7 @@ ieee80211_mark_ht40intol(void *arg, wlan
+             eacs_trace(EACS_DBG_OBSS,("Scan entry Chan %d within overlap range ( %d - %d ) -Marking chan %d \n",
+                         sechan, ochk->olminlimit, ochk->olmaxlimit,
+                         ieee80211_chan2ieee(acs->acs_ic, channel)));
+-            channel->ic_flags |= IEEE80211_CHAN_HT40INTOL;
++            //channel->ic_flags |= IEEE80211_CHAN_HT40INTOL;
+         }
+     }
+     return EOK;
+@@ -1480,7 +1480,7 @@ ieee80211_find_ht40intol_overlap(ieee802
+ 
+     if ((extchan > 0) &&(( acs->acs_noisefloor[extchan] != NF_INVALID) && (acs->acs_noisefloor[extchan] > ACS_11NG_NOISE_FLOOR_REJ) )){
+         eacs_trace(EACS_DBG_OBSS, (" Reject extension channel: %d  noise is: %d ",extchan,acs->acs_noisefloor[extchan]));
+-        channel->ic_flags |= IEEE80211_CHAN_HT40INTOL;
++        //channel->ic_flags |= IEEE80211_CHAN_HT40INTOL;
+     }
+ 
+     eacs_trace(EACS_DBG_OBSS, (" selected chan %d  overlap %x ",ieee_chan,(channel->ic_flags & IEEE80211_CHAN_HT40INTOL)));

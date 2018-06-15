@@ -1,0 +1,194 @@
+This allows propagating DFS/radar/cac/nop events to WM and
+subsequently to cloud.
+
+Each event cover HT20 channel. Before RADAR events we will
+get NOP events.
+
+CAC example:
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_START on channel 100
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_START on channel 104
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_START on channel 108
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_START on channel 112
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_COMPLETED on channel 100
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_COMPLETED on channel 104
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_COMPLETED on channel 108
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_CAC_COMPLETED on channel 112
+
+RADAR example:
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_START on channel 100
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_START on channel 104
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_START on channel 108
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_START on channel 112
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_RADAR_DETECTED on channel 100
+
+NOP_FINISHED example:
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_FINISHED on channel 100
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_FINISHED on channel 104
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_FINISHED on channel 108
+WM[1309]: <NOTICE>   RADIO: wifi2: Detected dfs event EVENT_RADIO_NOP_FINISHED on channel 112
+
+RADAR event generated only for control channel.
+
+--- a/lmac/dfs/dfs.c
++++ b/lmac/dfs/dfs.c
+@@ -29,6 +29,8 @@
+ #include "dfs_ioctl.h"
+ #include "dfs.h"
+ 
++#include <ieee80211_ioctl.h>
++
+ int domainoverride=DFS_UNINIT_DOMAIN;
+ 
+ /*
+@@ -147,6 +149,67 @@ static OS_TIMER_FUNC(dfs_tx_rcsa_task)
+     STA_VAP_DOWNUP_UNLOCK(ic);
+ }
+ 
++static char *dfs_event(u_int16_t event)
++{
++    switch (event) {
++        case IEEE80211_EV_RADAR_DETECT:
++            return "RADAR_DETECT";
++        case IEEE80211_EV_CAC_START:
++            return "CAC_START";
++        case IEEE80211_EV_CAC_COMPLETED:
++            return "CAC_COMPLETED";
++        case IEEE80211_EV_NOP_START:
++            return "NOP_START";
++        case IEEE80211_EV_NOP_FINISHED:
++            return "NOP_FINISHED";
++        default:
++            break;
++    }
++    return "unknown";
++}
++void dfs_deliver_event(struct ieee80211com *ic, u_int8_t chan, u_int16_t event)
++{
++    struct net_device *dev = NULL;
++    union iwreq_data wreq;
++
++    if(!ic && !(ic->ic_osdev)) {
++        printk(KERN_ERR "%s: ic / ic->ic_osdev is NULL. No dfs %s event.\n", __func__, dfs_event(event));
++        return;
++    }
++
++    dev = (struct net_device *)(ic->ic_osdev->netdev);
++
++    if(!dev) {
++        printk(KERN_ERR "%s: dev is NULL. No dfs %s event.\n", __func__, dfs_event(event));
++        return;
++    }
++
++    OS_MEMSET(&wreq, 0, sizeof(wreq));
++    wreq.data.flags = event;
++    wreq.data.length = sizeof(chan);
++
++    WIRELESS_SEND_EVENT(dev, IWEVCUSTOM, &wreq, (char *)&chan);
++    printk(KERN_INFO "%s: dfs %s event delivered on chan %d.\n", __func__, dfs_event(event), chan);
++}
++EXPORT_SYMBOL(dfs_deliver_event);
++
++void dfs_deliver_events(struct ieee80211com *ic, struct ieee80211_channel *chan, u_int16_t event)
++{
++    struct ieee80211_channel_list chan_info;
++    int i;
++
++    chan_info.cl_nchans= 0;
++    ic->ic_get_ext_chan_info (ic, chan, &chan_info);
++    for (i = 0; i < chan_info.cl_nchans; i++)
++    {
++        if (chan_info.cl_channels[i] == NULL)
++            continue;
++
++        dfs_deliver_event(ic, chan_info.cl_channels[i]->ic_ieee, event);
++    }
++}
++EXPORT_SYMBOL(dfs_deliver_events);
++
+ static OS_TIMER_FUNC(dfs_task)
+ {
+     struct ieee80211com *ic;
+@@ -214,6 +277,8 @@ static OS_TIMER_FUNC(dfs_task)
+         }
+ #endif
+ 
++        dfs_deliver_event(ic, ic->ic_curchan->ic_ieee, IEEE80211_EV_RADAR_DETECT);
++
+         /*
+          * This calls into the umac DFS code, which sets the umac related
+          * radar flags and begins the channel change machinery.
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -2143,6 +2143,11 @@ enum {
+ #endif
+     IEEE80211_EV_UNPROTECTED_DEAUTH_IND_STA,
+     IEEE80211_EV_HIDE_SSID_UPDATE,
++    IEEE80211_EV_RADAR_DETECT,
++    IEEE80211_EV_CAC_START,
++    IEEE80211_EV_CAC_COMPLETED,
++    IEEE80211_EV_NOP_START,
++    IEEE80211_EV_NOP_FINISHED,
+ };
+ 
+ #endif /* __linux__ */
+--- a/lmac/dfs/dfs.h
++++ b/lmac/dfs/dfs.h
+@@ -777,4 +777,7 @@ void dfs_start_tx_rcsa_and_waitfor_rx_cs
+ 
+ struct ieee80211_channel *ieee80211_get_extchan(struct ieee80211com *ic);
+ 
++void dfs_deliver_event(struct ieee80211com *ic, u_int8_t chan, u_int16_t event);
++void dfs_deliver_events(struct ieee80211com *ic, struct ieee80211_channel *chan, u_int16_t event);
++
+ #endif  /* _DFS_H_ */
+--- a/lmac/dfs/dfs_nol.c
++++ b/lmac/dfs/dfs_nol.c
+@@ -259,6 +259,7 @@ dfs_nol_addchan(struct ath_dfs *dfs, str
+     /* Update the NOL counter */
+     dfs->dfs_nol_count++;
+ 
++    dfs_deliver_event(dfs->ic, chan->ic_ieee, IEEE80211_EV_NOP_START);
+     DFS_DPRINTK(dfs, ATH_DEBUG_DFS_NOL,
+       "%s: new NOL channel %d MHz / %d MHz\n",
+       __func__,
+@@ -281,6 +282,7 @@ static void
+ dfs_nol_delete(struct ath_dfs *dfs, u_int16_t delfreq, u_int16_t delchwidth)
+ {
+     struct dfs_nolelem *nol,**prev_next;
++    u_int8_t delchan;
+ 
+     if (dfs == NULL) {
+         DFS_DPRINTK(dfs, ATH_DEBUG_DFS, "%s: sc_dfs is NULL\n", __func__);
+@@ -291,11 +293,13 @@ dfs_nol_delete(struct ath_dfs *dfs, u_in
+       "%s: remove channel=%d/%d MHz from NOL\n",
+       __func__,
+       delfreq, delchwidth);
++    delchan = dfs->ic->ic_mhz2ieee(dfs->ic, delfreq, 0);
+     prev_next = &(dfs->dfs_nol);
+     nol = dfs->dfs_nol;
+     while (nol != NULL) {
+         if (nol->nol_freq == delfreq && nol->nol_chwidth == delchwidth) {
+             *prev_next = nol->nol_next;
++            dfs_deliver_event(dfs->ic, delchan, IEEE80211_EV_NOP_FINISHED);
+             DFS_DPRINTK(dfs, ATH_DEBUG_DFS_NOL,
+               "%s removing channel %d/%dMHz from NOL tstamp=%d\n",
+                 __func__, nol->nol_freq, nol->nol_chwidth,
+--- a/umac/dfs/ieee80211_dfs.c
++++ b/umac/dfs/ieee80211_dfs.c
+@@ -1297,6 +1297,7 @@ OS_TIMER_FUNC(cac_timeout)
+ 		    "no radar detected\n",
+ 		    ic->ic_curchan->ic_ieee, ic->ic_curchan->ic_freq);
+ 
++                dfs_deliver_events(ic, ic->ic_curchan, IEEE80211_EV_CAC_COMPLETED);
+                 /* On CAC completion, set the bit 'cac_valid'.
+                  * CAC will not be re-done if this bit is reset.
+                  * The flag will be reset when cac_valid_timer timesout
+@@ -1775,6 +1776,8 @@ ieee80211_dfs_cac_timer_start_async(void
+     OS_SET_TIMER(&dfs->cac_timer, ieee80211_get_cac_timeout(ic,
+                 ic->ic_curchan) * 1000);
+ 
++    dfs_deliver_events(ic, ic->ic_curchan, IEEE80211_EV_CAC_START);
++
+     /*Send a CAC start event to user space*/
+     OSIF_RADIO_DELIVER_EVENT_CAC_START(ic);
+ }

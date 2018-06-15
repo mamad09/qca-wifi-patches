@@ -1,0 +1,25 @@
+The two errors commented out in the patch below produce a lot of noise in dmesg
+on Piranha_V1 QSDK5.2. Apparently they are harmless so they can safely be ignored.
+
+With Michal's blessing, this patch comments out the two harmless errors.
+
+--- a/offload/wlan/lmac_offload_if/ol_if_stats.c
++++ b/offload/wlan/lmac_offload_if/ol_if_stats.c
+@@ -1608,7 +1608,7 @@ process_tx_stats(struct ol_txrx_pdev_t *txrx_pdev,
+         peer_id = *((u_int32_t *)tx_ppdu_ctrl_desc + TX_PEER_ID_OFFSET);
+         max_peers = ol_cfg_max_peer_id(txrx_pdev->ctrl_pdev) + 1;
+         if (peer_id > max_peers) {
+-            qdf_print("\n Peer ID invalid  \n");
++            //qdf_print("\n Peer ID invalid  \n");
+             return -1;
+         }
+ 
+@@ -1779,7 +1779,7 @@ ol_ath_get_all_stats(void *pdev, enum WDI_EVENT event,
+          *Process TX message
+          */
+         if(process_tx_stats(pdev, log_data, peer_id, status)) {
+-            qdf_print("\n Unable to process TX info \n");
++            //qdf_print("\n Unable to process TX info \n");
+             return;
+         }
+         break;

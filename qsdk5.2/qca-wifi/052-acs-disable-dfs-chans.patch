@@ -1,0 +1,15 @@
+--- a/umac/acs/ieee80211_acs.c
++++ b/umac/acs/ieee80211_acs.c
+@@ -1254,6 +1254,12 @@ static INLINE void ieee80211_acs_get_phy
+                 continue;
+             }
+ 
++            /*WAR :: WAR :: WAR :: Skipping DFS channel while ACS*/
++            if (IEEE80211_IS_CHAN_DFS (channel)) {
++                printk ("DFS Channel Skipped::Chan NNumber %d\n", channel->ic_ieee);
++                continue;
++            }
++
+             ieee80211_get_extchaninfo(acs->acs_ic, channel, &chan_info);
+             
+             skipchanextinvalid = 0; 

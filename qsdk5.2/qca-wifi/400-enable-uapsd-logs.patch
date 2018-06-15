@@ -1,0 +1,12 @@
+--- a/umac/mlme/ieee80211_ie.c
++++ b/umac/mlme/ieee80211_ie.c
+@@ -2442,6 +2442,9 @@ ieee80211_parse_wmeie(u_int8_t *frm, con
+ 
+     IEEE80211_NOTE(ni->ni_vap, IEEE80211_MSG_POWER, ni,
+         "UAPSD bit settings from STA: %02x", ni->ni_uapsd);
++    printk(KERN_ERR "UAPSD bit settings: %02x - vap-%d (%s) from STA %pM\n",
++        ni->ni_uapsd, ni->ni_vap->iv_unit, ni->ni_vap->iv_netdev_name,
++        ni->ni_macaddr);
+ 
+     return 1;
+ }

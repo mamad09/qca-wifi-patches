@@ -1,0 +1,30 @@
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -9435,11 +9435,26 @@ ieee80211_ioctl_addmac(struct net_device
+     osif_dev *osifp = ath_netdev_priv(dev);
+     wlan_if_t vap = osifp->os_if;
+     struct sockaddr *sa = (struct sockaddr *)extra;
+-    int rc;
++    int rc, policy;
++    struct ieee80211req_mlme mlme;
+ 
+     debug_print_ioctl(dev->name, IEEE80211_IOCTL_ADDMAC, "addmac") ;
+ 
+     rc = wlan_set_acl_add(vap, sa->sa_data, IEEE80211_ACL_FLAG_ACL_LIST_1);
++
++    if (!rc) {
++        policy = wlan_get_acl_policy(vap, IEEE80211_ACL_FLAG_ACL_LIST_1);
++        if (policy == IEEE80211_MACCMD_POLICY_DENY) {
++            /* Setup a MLME request for disassociation of the given MAC */
++            mlme.im_op = IEEE80211_MLME_DISASSOC;
++            mlme.im_reason = IEEE80211_REASON_UNSPECIFIED;
++            IEEE80211_ADDR_COPY(&(mlme.im_macaddr), sa->sa_data);
++           
++            /* Send the MLME request and return the result. */
++            rc = ieee80211_ioctl_setmlme(dev, info, w, (char *)&mlme);
++        }
++    }
++
+     return rc;
+ }
+ 

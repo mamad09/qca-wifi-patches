@@ -1,0 +1,82 @@
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -8036,6 +8036,11 @@ ol_ath_pdev_get_temperature_event_handle
+ 
+     scn->therm = celsius;
+ 
++    if (scn->sc_ic.thermal_shutdown != 0 && scn->therm > scn->sc_ic.thermal_shutdown) {
++        printk("Temperature over thermal shutdown limit!\n", scn->therm);
++        BUG();
++    }
++
+     return 0;
+ }
+ 
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1503,6 +1503,8 @@ enum {
+     IEEE80211_PARAM_CSA_INTEROP_BSS,
+     IEEE80211_PARAM_CSA_INTEROP_AUTH,
+     IEEE80211_PARAM_CSA_INTEROP_AGGR,
++    IEEE80211_PARAM_THERM_SHUTDOWN,
++#define IEEE80211_PARAM_THERM_SHUTDOWN_SUPPORTED
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14617,6 +14617,8 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_CSA_ORDERING, 0, IW_PRIV_TYPE_CHAR | 33, "gcsaordering" },
+     { IEEE80211_PARAM_CSA_INTEROP_AGGR, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "scsainteropaggr" },
+     { IEEE80211_PARAM_CSA_INTEROP_AGGR, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "gcsainteropaggr" },
++    { IEEE80211_PARAM_THERM_SHUTDOWN, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0, "therm_shutdown" },
++    { IEEE80211_PARAM_THERM_SHUTDOWN, 0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_therm_shut" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -9323,6 +9323,11 @@ OS_TIMER_FUNC(ath_therm_poll_timer)
+         OS_SET_TIMER(&scn->therm_poll_timer, scn->therm_poll_interval);
+     }
+ 
++    if (scn->sc_ic.thermal_shutdown != 0 && therm > scn->sc_ic.thermal_shutdown) {
++        printk("Temperature over thermal shutdown limit!\n", therm);
++        BUG();
++    }
++
+     return;
+ }
+ 
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -1915,6 +1915,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     int                                 ic_uniform_rssi;
+     struct ieee80211_relax_amsdu_conf   ic_relax_amsdu;
+     enum ieee80211_csa_ordering         ic_csa_ordering;
++    int                                 thermal_shutdown;
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -3580,6 +3580,9 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+            retv = ic->ic_vap_set_param(vap, IEEE80211_SIFS_TRIGGER_RATE, (u_int32_t)value);
+         }
+         break;
++    case IEEE80211_PARAM_THERM_SHUTDOWN:
++        ic->thermal_shutdown = value;
++        break;
+     case IEEE80211_PARAM_BEACON_RATE_FOR_VAP:
+         if(vap->iv_opmode == IEEE80211_M_HOSTAP) {
+             int *rate_kbps = NULL;
+@@ -5516,6 +5519,9 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+         /* monitor vap decoder header type: radiotap=0(default) prism=1 */
+         *value = wlan_get_param(vap, IEEE80211_CONFIG_MON_DECODER);
+         break;
++    case IEEE80211_PARAM_THERM_SHUTDOWN:
++        *value = ic->thermal_shutdown;
++        break;
+     case IEEE80211_PARAM_BEACON_RATE_FOR_VAP:
+         if(vap->iv_opmode == IEEE80211_M_HOSTAP) {
+             *value = wlan_get_param(vap, IEEE80211_BEACON_RATE_FOR_VAP);

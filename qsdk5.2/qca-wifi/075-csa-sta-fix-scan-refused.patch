@@ -1,0 +1,59 @@
+There are a few internal knobs that track CSA
+state. One of them is ic->ic_flags and
+IEEE80211_F_CHANSWITCH.
+
+STA CSA code in 10.4 did not properly strip the
+flag. Normally this probably went undetected but
+one of our other (sanity) patches prevented driver
+from ever issuing scans again after lone STA CSA
+finished.
+
+This fixes both simple manual tests (that I tend
+to run when I isolate bugs) as well as real-world
+corner case when parent AP performs CSA while leaf
+is onboarding.
+--- a/umac/mlme/ieee80211_mgmt_sta.c
++++ b/umac/mlme/ieee80211_mgmt_sta.c
+@@ -201,6 +201,7 @@ static OS_TIMER_FUNC(ieee80211_synced_ch
+                     }
+                 }
+ 
++                ic->ic_flags &= ~IEEE80211_F_CHANSWITCH;
+                 IEEE80211_CHAN_SWITCH_END(ic);
+ 
+             } else if (err == EBUSY) {
+@@ -706,6 +707,7 @@ void ieee80211_mlme_chanswitch_continue(
+             ieee80211_mlme_recv_csa(ni, IEEE80211_RADAR_DETECT_DEFAULT_DELAY,true);
+         }
+ 
++    ic->ic_flags &= ~IEEE80211_F_CHANSWITCH;
+     IEEE80211_CHAN_SWITCH_END(ic);
+ }
+ 
+--- a/offload/wlan/lmac_offload_if/ol_if_vap.c
++++ b/offload/wlan/lmac_offload_if/ol_if_vap.c
+@@ -2291,6 +2291,14 @@ static int ol_ath_vap_stopping(struct ie
+    case IEEE80211_M_STA:
+         OS_CANCEL_TIMER(&vap->iv_cswitch_timer);
+         OS_CANCEL_TIMER(&vap->iv_disconnect_sta_timer);
++        /* Cancelling cswitch timer doesn't mean
++         * it was ever run and so the CSA flag may
++         * need clearing.
++         *
++         * Expected usecase is 1 STA VAP + 0..N AP VAPs.
++         */
++        if (ieee80211_num_apvap_running(ic) == 0)
++            ic->ic_flags &= ~IEEE80211_F_CHANSWITCH;
+         break;
+     default:
+         break;
+--- a/umac/base/ieee80211_vap.c
++++ b/umac/base/ieee80211_vap.c
+@@ -852,6 +852,7 @@ ieee80211_num_apvap_running(struct ieee8
+     IEEE80211_COMM_UNLOCK(ic);
+     return running;
+ }
++EXPORT_SYMBOL(ieee80211_num_apvap_running);
+ 
+ /**
+  * @ get opmode

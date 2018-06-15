@@ -1,0 +1,143 @@
+--- a/hal/ah.h
++++ b/hal/ah.h
+@@ -2629,6 +2629,7 @@ struct ath_hal {
+     u_int8_t __ahdecl(*ah_disable_basic_3wire_btcoex)(struct ath_hal *);
+ #endif
+     int       __ahdecl(*ah_get_therm)(struct ath_hal *ah);
++    u_int     __ahdecl(*ah_mac_to_clks)(struct ath_hal *ah, u_int usec);
+ #ifdef ATH_SUPPORT_DFS
+     u_int32_t   ah_use_cac_prssi;  /* we may use different PRSSI value during CAC */
+ #endif
+--- a/hal/ar9300/ar9300_attach.c
++++ b/hal/ar9300/ar9300_attach.c
+@@ -581,6 +581,7 @@ static const struct ath_hal_private ar93
+         ar9300_disable_basic_3wire_btcoex, /* ah_disable_basic_3wire_btcoex */
+ #endif
+         .ah_get_therm = ar9300_get_therm,
++        .ah_mac_to_clks = ar9300_mac_to_clks,
+     },
+ 
+     ar9300_get_channel_edges,              /* ah_get_channel_edges */
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -3896,6 +3896,7 @@ struct ath_ops {
+     u_int32_t   (*get_last_txpower)(ath_node_t node);
+     bool        (*direct_rate_check)(ath_dev_t dev,int val);
+     int         (*get_therm)(ath_dev_t dev, int *therm);
++    int         (*mac_to_clks)(ath_dev_t dev, int usec);
+ 
+ };
+ 
+--- a/lmac/ath_dev/ath_internal.h
++++ b/lmac/ath_dev/ath_internal.h
+@@ -4211,6 +4211,8 @@ extern int16_t ath_hal_getChanNoise(stru
+     ((*(_ah)->ah_reset_nav)((_ah)))
+ #define ath_hal_get_therm(_ah) \
+     ((*(_ah)->ah_get_therm)((_ah)))
++#define ath_hal_mac_to_clks(_ah, _arg) \
++    ((*(_ah)->ah_mac_to_clks)((_ah), (_arg)))
+ 
+ #if ATH_BT_COEX_3WIRE_MODE
+ #define ath_hal_enable_basic_3wire_btcoex(_ah) \
+--- a/lmac/ath_dev/ath_main.c
++++ b/lmac/ath_dev/ath_main.c
+@@ -6976,6 +6976,14 @@ ath_get_therm(ath_dev_t dev, int *therm)
+     }
+ }
+ 
++static int
++ath_mac_to_clks(ath_dev_t dev, int usecs)
++{
++    struct ath_softc *sc = ATH_DEV_TO_SC(dev);
++
++    return ath_hal_mac_to_clks(sc->sc_ah, usecs);
++}
++
+ /*
+  * Callback table for Atheros ARXXXX MACs
+  */
+@@ -7497,6 +7505,7 @@ static const struct ath_ops ath_ar_ops =
+     ath_get_last_txpower,                  /* get last data tx power*/
+     ath_rate_check,                   /*direct_rate_check*/
+     .get_therm = ath_get_therm,
++    .mac_to_clks = ath_mac_to_clks,
+ };
+ 
+ int init_sc_params(struct ath_softc *sc,struct ath_hal *ah)
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -4692,6 +4692,26 @@ ol_set_beacon_interval(struct ieee80211c
+ }
+ 
+ static int
++ol_cc_clk_khz(struct ieee80211com *ic)
++{
++    struct ol_ath_softc_net80211 *scn;
++
++    scn = OL_ATH_SOFTC_NET80211(ic);
++    switch (scn->target_type) {
++        case TARGET_TYPE_AR9888:
++            return 88000;
++        case TARGET_TYPE_IPQ4019:
++            return 125000;
++        case TARGET_TYPE_QCA9888:
++        case TARGET_TYPE_QCA9984:
++            return 150000;
++    }
++
++    WARN_ONCE(1, "unhandled target type: %d, defaulting clock rate to 88mhz", scn->target_type);
++    return 88000;
++}
++
++static int
+ ol_ath_reset(struct ieee80211com *ic)
+ {
+     /* TBD */
+@@ -7119,6 +7139,7 @@ ol_ath_dev_attach(struct ol_ath_softc_ne
+ #endif
+     ic->ic_tr69_request_process = ol_ath_net80211_tr69_process_request;
+     ic->ic_get_therm = ol_ath_net80211_get_therm;
++    ic->ic_cc_clk_khz = ol_cc_clk_khz;
+     /*
+      * In Offload case 'inactivity' is handled in the firmware.
+      * So override the default function with a different one to handle other timeouts.
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -9103,6 +9103,19 @@ ath_net80211_get_mac_prealloc_idmask(str
+     return scn->sc_prealloc_idmask;
+ }
+ 
++static int
++ath_net80211_cc_clk_khz(struct ieee80211com *ic)
++{
++    struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
++    int khz = 44000;
++    int usecs = 1000;
++
++    if (scn->sc_ops->mac_to_clks)
++        khz = scn->sc_ops->mac_to_clks(scn->sc_dev, usecs);
++
++    return khz;
++}
++
+ #if ATH_BAND_STEERING
+ static bool
+ ath_net80211_bs_set_params(struct ieee80211com *ic,
+@@ -9655,6 +9668,7 @@ ath_attach(u_int16_t devid, void *base_a
+     ic->ic_is_mode_offload = ath_net80211_is_mode_offload;
+     ic->ic_is_macreq_enabled = ath_net80211_is_macreq_enabled;
+     ic->ic_get_mac_prealloc_idmask = ath_net80211_get_mac_prealloc_idmask;
++    ic->ic_cc_clk_khz = ath_net80211_cc_clk_khz;
+ 
+     /* Attach the direct attach print scan function */
+     ic->ic_print_scan_config = wlan_print_scan_config;
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -1886,6 +1886,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     u_int32_t                           ic_chan_utilization;   /* channel utilization statistics */
+     u_int8_t                            ic_bestUL_hyst;
+     int                                 (*ic_get_therm)(struct ieee80211com *ic, int *signal_dbm);
++    int                                 (*ic_cc_clk_khz)(struct ieee80211com *ic);
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10

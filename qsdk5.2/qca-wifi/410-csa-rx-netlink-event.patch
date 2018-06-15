@@ -1,0 +1,153 @@
+Whenever STA vap receives a CSA from parent in
+Beacon Frame or Action Frame it is exposed to
+userspace.
+
+This allows userspace to be more proactive with
+regard to behavior on CSA.
+
+Main intent of this however is to support
+cross-radio CSA in a scenario where a parent
+changes channel to something that is not supported
+by child's current radio (e.g. there's 5GU / 5GL
+split between 2 radios, i.e. Caesar).
+
+Userspace is expected to perform an implicit
+parent change between radios (parent Piranha's mac
+address stays the same when it switches between
+5GU / 5GL channel sets).
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -2094,6 +2094,15 @@ struct  {
+ };
+ 
+ 
++struct ieee80211_csa_rx_ev {
++    int valid;
++    int chan;
++    int width_mhz;
++    int secondary; /* -1: below, 1: above */
++    int cfreq2_mhz; /* for 80+80 */
++    char bssid[6];
++};
++
+ /* kev event_code value for Atheros IEEE80211 events */
+ enum {
+     IEEE80211_EV_SCAN_DONE,
+@@ -2148,8 +2157,11 @@ enum {
+     IEEE80211_EV_CAC_COMPLETED,
+     IEEE80211_EV_NOP_START,
+     IEEE80211_EV_NOP_FINISHED,
++    IEEE80211_EV_CSA_RX, /* reported when STA vap receives Beacon/Action frame with CSA IE */
+ };
+ 
++#define IEEE80211_EV_CSA_RX_SUPPORTED /* enums aren't ifdef-able */
++
+ #endif /* __linux__ */
+ 
+ #define IEEE80211_VAP_PROFILE_NUM_ACL 64
+--- a/umac/mlme/ieee80211_mgmt_sta.c
++++ b/umac/mlme/ieee80211_mgmt_sta.c
+@@ -223,6 +223,70 @@ static OS_TIMER_FUNC(ieee80211_synced_ch
+     vap->iv_cswitch_rxd = 0;
+ }
+ 
++void
++ieee80211_mgmt_sta_send_csa_rx_nl_msg(
++        struct ieee80211com                         *ic,
++        struct ieee80211_node                       *ni,
++        struct ieee80211_channel                    *chan,
++        struct ieee80211_channelswitch_ie           *chanie,
++        struct ieee80211_extendedchannelswitch_ie   *echanie,
++        struct ieee80211_ie_sec_chan_offset         *secchanoffsetie,
++        struct ieee80211_ie_wide_bw_switch          *widebwie)
++{
++    struct ieee80211_csa_rx_ev csa_rx_ev = {};
++    union iwreq_data wreq = {};
++    struct net_device *dev;
++
++    memcpy(csa_rx_ev.bssid, ni->ni_macaddr, 6);
++    csa_rx_ev.valid = !!chan;
++
++    if (chanie)
++        csa_rx_ev.chan = chanie->newchannel;
++    else if (echanie)
++        csa_rx_ev.chan = echanie->newchannel;
++
++    if (widebwie) {
++        csa_rx_ev.cfreq2_mhz = widebwie->new_ch_freq_seg2;
++        switch (widebwie->new_ch_width) {
++            case IEEE80211_CWM_WIDTH20:    csa_rx_ev.width_mhz = 20;  break;
++            case IEEE80211_CWM_WIDTH40:    csa_rx_ev.width_mhz = 40;  break;
++            case IEEE80211_CWM_WIDTH80:    csa_rx_ev.width_mhz = 80;  break;
++            case IEEE80211_CWM_WIDTH160:   csa_rx_ev.width_mhz = 160; break;
++            case IEEE80211_CWM_WIDTH80_80: csa_rx_ev.width_mhz = 160; break;
++        }
++    }
++
++    if (secchanoffsetie) {
++        switch (secchanoffsetie->sec_chan_offset) {
++            case IEEE80211_SEC_CHAN_OFFSET_SCN: csa_rx_ev.secondary = 0;  break;
++            case IEEE80211_SEC_CHAN_OFFSET_SCA: csa_rx_ev.secondary = 1;  break;
++            case IEEE80211_SEC_CHAN_OFFSET_SCB: csa_rx_ev.secondary = -1; break;
++        }
++    }
++
++    wreq.data.flags = IEEE80211_EV_CSA_RX;
++    wreq.data.length = sizeof(csa_rx_ev);
++
++    if (!ic)
++        return;
++    if (!ic->ic_osdev)
++        return;
++
++    dev = (void *)ic->ic_osdev->netdev;
++    if (!dev)
++        return;
++
++    printk("%s: valid=%d chan=%d width=%d sec=%d cfreq2=%d\n",
++           __func__,
++           csa_rx_ev.valid,
++           csa_rx_ev.chan,
++           csa_rx_ev.width_mhz,
++           csa_rx_ev.secondary,
++           csa_rx_ev.cfreq2_mhz);
++
++    WIRELESS_SEND_EVENT(dev, IWEVCUSTOM, &wreq, (void *)&csa_rx_ev);
++}
++
+ void ieee80211_recv_beacon_sta(struct ieee80211_node *ni, wbuf_t wbuf, int subtype,
+                                struct ieee80211_rx_status *rs, ieee80211_scan_entry_t  scan_entry)
+ {
+@@ -463,6 +527,7 @@ void ieee80211_recv_beacon_sta(struct ie
+                     vap->iv_ni = ni;
+                     OS_SET_TIMER(&vap->iv_disconnect_sta_timer,IEEE80211_TU_TO_MS(ni->ni_chanswitch_tbtt*ni->ni_intval));
+                 }
++                ieee80211_mgmt_sta_send_csa_rx_nl_msg(ic, ni, chan, chanie, echanie, secchanoff, widebwie);
+ 
+            }
+ 
+--- a/umac/mlme/ieee80211_ie.c
++++ b/umac/mlme/ieee80211_ie.c
+@@ -3393,6 +3393,14 @@ ieee80211_process_csa_ecsa_ie (
+    struct ieee80211_action * pia
+     )
+ {
++    extern void ieee80211_mgmt_sta_send_csa_rx_nl_msg(
++            struct ieee80211com                         *ic,
++            struct ieee80211_node                       *ni,
++            struct ieee80211_channel                    *chan,
++            struct ieee80211_channelswitch_ie           *chanie,
++            struct ieee80211_extendedchannelswitch_ie   *echanie,
++            struct ieee80211_ie_sec_chan_offset         *secchanoffsetie,
++            struct ieee80211_ie_wide_bw_switch          *widebwie);
+     struct ieee80211_extendedchannelswitch_ie * pecsaIe = NULL;
+     struct ieee80211_channelswitch_ie * pcsaIe = NULL;
+     struct ieee80211_ie_sec_chan_offset *psecchanoffsetIe = NULL;
+@@ -3460,6 +3468,7 @@ ieee80211_process_csa_ecsa_ie (
+     }
+ 
+     chan = ieee80211_get_new_sw_chan (ni, pcsaIe, pecsaIe, psecchanoffsetIe, pwidebwie, cswarp);
++    ieee80211_mgmt_sta_send_csa_rx_nl_msg(ic, ni, chan, pcsaIe, pecsaIe, psecchanoffsetIe, pwidebwie);
+ 
+     if(!chan)
+         return EOK;

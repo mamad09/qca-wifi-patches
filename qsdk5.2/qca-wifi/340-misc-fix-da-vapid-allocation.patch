@@ -1,0 +1,43 @@
+Driver implements a couple of different, somewhat
+overlaping, vapid & macaddr/bssid allocation
+schemes depending on interfaces used,
+configuration applied and interface creation
+parameters.
+
+DA radio code was unconditionally free vap macaddr
+that could be allocated only if macreq iwpriv was
+enabled (plus other extra additional criteria).
+
+This led to driver using incosistent if_id
+calculation causing vap deletion/freeing to unmask
+wrong entries subsequently causing interface
+creation to stop working.
+
+The fix will work as long as macreq is not changed
+during runtime after interface were already
+created. This is sufficient for our use case.
+
+The problem was reproduced with the following:
+
+	addr0=$(cat /sys/class/net/wifi0/address)
+	addr1=42:$(cat /sys/class/net/wifi0/address | cut -d: -f2-)
+	addr2=52:$(cat /sys/class/net/wifi0/address | cut -d: -f2-)
+
+	wlanconfig bhaul-ap-24 create wlandev wifi0 wlanmode ap vapid 1 -bssid $addr1
+	wlanconfig home-ap-24 create wlandev wifi0 wlanmode ap vapid 2 -bssid $addr2
+	wlanconfig bhaul-sta-24 create wlandev wifi0 wlanmode sta vapid 0 -bssid $addr0
+	wlanconfig bhaul-sta-24 destroy
+	wlanconfig bhaul-sta-24 create wlandev wifi0 wlanmode sta vapid 0 -bssid $addr0
+	wlanconfig bhaul-sta-24 destroy
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -1548,6 +1548,9 @@ ath_vap_free_macaddr(struct ieee80211com
+     /* extract the id from the bssid */
+     ATH_GET_VAP_ID(bssid, ic->ic_my_hwaddr, id);
+ 
++    if (!ic->ic_is_macreq_enabled(ic))
++        return -1;
++
+ #if UMAC_SUPPORT_P2P
+     if (id == ATH_P2PDEV_IF_ID) {
+         DPRINTF(scn, ATH_DEBUG_STATE, "%s P2P device mac address \n", __func__);

@@ -1,0 +1,718 @@
+--- a/os/linux/tools/Makefile
++++ b/os/linux/tools/Makefile
+@@ -48,13 +48,18 @@ endif
+ 
+ ifeq ($(ATH_SUPPORT_CFG_8K), 1)
+ ALL=  cgiMain 80211stats athstats athstatsclr apstats athkey athchans athctrl athdebug wlanconfig \
+-      athcwm athampdutrc atrc pktlogconf pktlogdump thermaltool exttool
++      athcwm athampdutrc atrc pktlogconf pktlogdump thermaltool exttool \
++      plume
+ 
+-ATH_TOOLS= cgiMain 80211stats athstats athstatsclr apstats pktlogconf pktlogdump wifitool wlanconfig thermaltool exttool
++ATH_TOOLS= cgiMain 80211stats athstats athstatsclr apstats pktlogconf pktlogdump wifitool wlanconfig thermaltool exttool \
++           plume
+ else
+ ALL=  80211stats athstats athstatsclr apstats athkey athchans athctrl athdebug wlanconfig \
+-      athcwm athampdutrc atrc pktlogconf pktlogdump thermaltool wps_enhc exttool
+-ATH_TOOLS= 80211stats athstats athstatsclr apstats pktlogconf pktlogdump wifitool wlanconfig thermaltool wps_enhc exttool
++      athcwm athampdutrc atrc pktlogconf pktlogdump thermaltool wps_enhc exttool \
++      plume
++ATH_TOOLS= 80211stats athstats athstatsclr apstats pktlogconf pktlogdump wifitool wlanconfig thermaltool wps_enhc exttool \
++           plume
++
+ ifeq ($(UMAC_SUPPORT_WNM), 1)
+ ATH_TOOLS += wnm-app
+ endif
+@@ -180,6 +185,7 @@ ifneq ($(BOARD_TYPE),ap91-2MB)
+ 	cp wlanconfig $(INSTALL_ROOT)/sbin;
+ 	cp thermaltool $(INSTALL_ROOT)/sbin;
+ 	cp exttool $(INSTALL_ROOT)/sbin;
++	cp plume $(INSTALL_ROOT)/sbin;
+ ifeq ($(ATH_SUPPORT_CFG_8K), 1)
+ 	cp cgiMain $(INSTALL_ROOT)/sbin;
+ 	cp scripts/wlan/rc.* $(INSTALL_ROOT)/sbin;
+@@ -299,6 +305,8 @@ wifitool: wifitool.c
+ 	${CC} -o wifitool ${CFLAGS} ${LDFLAGS} -lpthread wifitool.c
+ wlanconfig: wlanconfig.c
+ 	${CC} -o wlanconfig ${CFLAGS} ${LDFLAGS} wlanconfig.c
++plume: plume.c
++	${CC} -o plume ${CFLAGS} ${LDFLAGS} plume.c -I../../../include/
+ wnm-app: tfs-app.c
+ 	${CC} -o wnm-app ${CFLAGS} ${LDFLAGS} tfs-app.c
+ 80211debug: 80211debug.c
+@@ -343,6 +351,7 @@ install: ${ALL}
+ 	-rm ${DESTDIR}/${BINDIR}/wlandebug
+ 	ln ${DESTDIR}/${BINDIR}/80211debug ${DESTDIR}/${BINDIR}/wlandebug
+ 	cp wlanconfig ${DESTDIR}${BINDIR}
++	cp plume ${DESTDIR}${BINDIR}
+ 	cp tfs-app ${DESTDIR}${BINDIR}
+ 	cp radartool ${DESTDIR}${BINDIR}/radartool
+ 	cp spectraltool ${DESTDIR}${BINDIR}/spectraltool
+@@ -364,7 +373,7 @@ ifeq ($(ATH_SUPPORT_TX99),1)
+ endif
+ 
+ ath_tools_clean:
+-	@rm -f wps_enhc athstats 80211stats athstatsclr apstats pktlogdump pktlogconf radartool spectraltool tx99tool wifitool cgiMain wlanconfig thermaltool
++	@rm -f wps_enhc athstats 80211stats athstatsclr apstats pktlogdump pktlogconf radartool spectraltool tx99tool wifitool cgiMain wlanconfig thermaltool plume
+ ifeq ($(DEBUG_TOOLS), 1)
+ 	@rm -f dumpregs reg && rm -f hal_diag/*.o
+ endif
+--- /dev/null
++++ b/os/linux/tools/plume.c
+@@ -0,0 +1,656 @@
++#include <stdio.h>
++#include <stdarg.h>
++#include <assert.h>
++#include <linux/socket.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <sys/time.h>
++#include <stdio.h>
++#include <math.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <ctype.h>
++#include <stdlib.h>
++#include <netdb.h>
++#include <unistd.h>
++#include <string.h>
++#include <linux/types.h>
++#include <linux/if.h>
++#include <linux/wireless.h>
++
++typedef unsigned long long u64;
++typedef unsigned int       u32;
++typedef unsigned short     u16;
++typedef unsigned char      u8;
++
++#ifndef DIV_ROUND_UP
++#define DIV_ROUND_UP(x, y) ((x + (y - 1)) / (y))
++#endif
++
++#include <ps_uapi.h>
++
++static void usage(const char *name, const char *reason, ...);
++
++#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
++#define die(fmt, ...)							\
++		do {							\
++			fprintf(stderr, "errno: %d (%s), " fmt "\n",	\
++				errno,					\
++				strerror(errno),			\
++				## __VA_ARGS__);			\
++			exit(EXIT_FAILURE);				\
++		} while (0)
++
++static void peer_rx_stats_handle(const struct ps_uapi_ioctl *cmd)
++{
++	struct ps_cmn_rate_info ri = {};
++	int rix;
++
++	printf("addr = %02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx\n",
++	       cmd->u.peer_rx_stats.set.addr[0],
++	       cmd->u.peer_rx_stats.set.addr[1],
++	       cmd->u.peer_rx_stats.set.addr[2],
++	       cmd->u.peer_rx_stats.set.addr[3],
++	       cmd->u.peer_rx_stats.set.addr[4],
++	       cmd->u.peer_rx_stats.set.addr[5]);
++	printf("cookie = %016llx\n",
++	       cmd->u.peer_rx_stats.get.cookie);
++
++	printf("%20s | %3s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n",
++	       "rate",
++	       "rix",
++	       "bytes",
++	       "msdus",
++	       "mpdus",
++	       "ppdus",
++	       "retries",
++	       "rssi",
++	       "rssi 1 p20",
++	       "rssi 1 e20",
++	       "rssi 1 e40",
++	       "rssi 1 e80",
++	       "rssi 2 p20",
++	       "rssi 2 e20",
++	       "rssi 2 e40",
++	       "rssi 2 e80",
++	       "rssi 3 p20",
++	       "rssi 3 e20",
++	       "rssi 3 e40",
++	       "rssi 3 e80",
++	       "rssi 4 p20",
++	       "rssi 4 e20",
++	       "rssi 4 e40",
++	       "rssi 4 e80");
++
++	memset(&ri, 0, sizeof(ri));
++	ri.is_cck = 1;
++	for (ri.mcs = 0; ri.mcs < PS_MAX_CCK; ri.mcs++) {
++		rix = ps_cmn_calc_rix(&ri);
++		printf("%4s %15s | %3u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u\n",
++		       "CCK",
++		       ps_cmn_cck_str(ri.mcs),
++		       rix,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_bytes,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_msdus,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_mpdus,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_ppdus,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_retries,
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi,
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][3],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][3],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][3],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][3]);
++	}
++
++	memset(&ri, 0, sizeof(ri));
++	for (ri.mcs = 0; ri.mcs < PS_MAX_OFDM; ri.mcs++) {
++		rix = ps_cmn_calc_rix(&ri);
++		printf("%4s %15s | %3u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10u\n",
++		       "OFDM",
++		       ps_cmn_ofdm_str(ri.mcs),
++		       rix,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_bytes,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_msdus,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_mpdus,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_ppdus,
++		       cmd->u.peer_rx_stats.get.stats[rix].num_retries,
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi,
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][3],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][3],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][3],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][0],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][1],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][2],
++		       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][3]);
++	}
++
++	printf("HT / VHT:\n");
++	printf("%5s | %3s | %3s | %3s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s | %10s\n",
++	       "bw",
++	       "nss",
++	       "mcs",
++	       "rix",
++	       "bytes",
++	       "msdus",
++	       "mpdus",
++	       "ppdus",
++	       "retries",
++	       "sgi",
++	       "rssi",
++	       "rssi 1 p20",
++	       "rssi 1 e20",
++	       "rssi 1 e40",
++	       "rssi 1 e80",
++	       "rssi 2 p20",
++	       "rssi 2 e20",
++	       "rssi 2 e40",
++	       "rssi 2 e80",
++	       "rssi 3 p20",
++	       "rssi 3 e20",
++	       "rssi 3 e40",
++	       "rssi 3 e80",
++	       "rssi 4 p20",
++	       "rssi 4 e20",
++	       "rssi 4 e40",
++	       "rssi 4 e80");
++
++	memset(&ri, 0, sizeof(ri));
++	ri.is_ht = 1;
++	for (ri.bw = 0; ri.bw < PS_MAX_BW; ri.bw++) {
++		for (ri.nss = 0; ri.nss < PS_MAX_NSS; ri.nss++) {
++			for (ri.mcs = 0; ri.mcs < PS_MAX_MCS; ri.mcs++) {
++				rix = ps_cmn_calc_rix(&ri);
++				printf("%5s | %3u | %3u | %3u | %10u | %10u | %10u | %10u | %10u | %10u | %10u | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu | %10hhu\n",
++				       ps_cmn_bw_str(ri.bw),
++				       ri.nss + 1,
++				       ri.mcs,
++				       rix,
++				       cmd->u.peer_rx_stats.get.stats[rix].num_bytes,
++				       cmd->u.peer_rx_stats.get.stats[rix].num_msdus,
++				       cmd->u.peer_rx_stats.get.stats[rix].num_mpdus,
++				       cmd->u.peer_rx_stats.get.stats[rix].num_ppdus,
++				       cmd->u.peer_rx_stats.get.stats[rix].num_retries,
++				       cmd->u.peer_rx_stats.get.stats[rix].num_sgi,
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi,
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][0],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][1],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][2],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[0][3],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][0],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][1],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][2],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[1][3],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][0],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][1],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][2],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[2][3],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][0],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][1],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][2],
++				       cmd->u.peer_rx_stats.get.stats[rix].ave_rssi_ant[3][3]);
++			}
++		}
++	}
++}
++
++static void peer_rx_stats_prepare(int argc,
++				  const char **argv,
++				  struct ps_uapi_ioctl *cmd)
++{
++	char mac[6] = {};
++	int err;
++
++	if (argc < 4)
++		usage(argv[0], "peer_rx_stats: missing argument: mac address");
++	if (argc > 4)
++		usage(argv[0], "peer_rx_stats: too many arguments");
++
++	err = sscanf(argv[3],
++		     "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
++		     &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
++	if (err != 6)
++		die("sscanf()=%d of mac address failed", err);
++
++	cmd->cmd = PS_UAPI_IOCTL_CMD_PEER_RX_STATS;
++	memcpy(cmd->u.peer_rx_stats.set.addr, mac, sizeof(mac));
++}
++
++static void peer_tx_stats_prepare(int argc,
++				  const char **argv,
++				  struct ps_uapi_ioctl *cmd)
++{
++	char mac[6] = {};
++	int err;
++
++	if (argc < 4)
++		usage(argv[0], "peer_tx_stats: missing argument: mac address");
++	if (argc > 4)
++		usage(argv[0], "peer_tx_stats: too many arguments");
++
++	err = sscanf(argv[3],
++		     "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
++		     &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
++	if (err != 6)
++		die("sscanf()=%d of mac address failed", err);
++
++	cmd->cmd = PS_UAPI_IOCTL_CMD_PEER_TX_STATS;
++	memcpy(cmd->u.peer_tx_stats.set.addr, mac, sizeof(mac));
++}
++
++static void peer_tx_stats_handle(const struct ps_uapi_ioctl *cmd)
++{
++	struct ps_cmn_rate_info ri = {};
++	int rix;
++	int tid;
++
++	printf("addr = %02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx\n",
++	       cmd->u.peer_tx_stats.set.addr[0],
++	       cmd->u.peer_tx_stats.set.addr[1],
++	       cmd->u.peer_tx_stats.set.addr[2],
++	       cmd->u.peer_tx_stats.set.addr[3],
++	       cmd->u.peer_tx_stats.set.addr[4],
++	       cmd->u.peer_tx_stats.set.addr[5]);
++	printf("cookie = %016llx\n",
++	       cmd->u.peer_tx_stats.get.cookie);
++
++	printf("Legacy:\n");
++	printf("%20s | %3s | %10s | %10s\n",
++	       "rate",
++	       "rix",
++	       "attempts",
++	       "success");
++
++	memset(&ri, 0, sizeof(ri));
++	ri.is_cck = 1;
++	for (ri.mcs = 0; ri.mcs < PS_MAX_CCK; ri.mcs++) {
++		rix = ps_cmn_calc_rix(&ri);
++		printf("%4s %15s | %3u | %10u | %10u\n",
++		       "CCK",
++		       ps_cmn_cck_str(ri.mcs),
++		       rix,
++		       cmd->u.peer_tx_stats.get.stats[rix].attempts,
++		       cmd->u.peer_tx_stats.get.stats[rix].success);
++	}
++
++	memset(&ri, 0, sizeof(ri));
++	for (ri.mcs = 0; ri.mcs < PS_MAX_OFDM; ri.mcs++) {
++		rix = ps_cmn_calc_rix(&ri);
++		printf("%4s %15s | %3u | %10u | %10u\n",
++		       "OFDM",
++		       ps_cmn_ofdm_str(ri.mcs),
++		       rix,
++		       cmd->u.peer_tx_stats.get.stats[rix].attempts,
++		       cmd->u.peer_tx_stats.get.stats[rix].success);
++	}
++
++	printf("HT / VHT:\n");
++	printf("%5s | %3s | %3s | %3s | %10s | %10s | %10s\n",
++	       "bw",
++	       "nss",
++	       "mcs",
++	       "rix",
++	       "attempts",
++	       "success",
++	       "ppdus");
++
++	memset(&ri, 0, sizeof(ri));
++	ri.is_ht = 1;
++	for (ri.bw = 0; ri.bw < PS_MAX_BW; ri.bw++) {
++		for (ri.nss = 0; ri.nss < PS_MAX_NSS; ri.nss++) {
++			for (ri.mcs = 0; ri.mcs < PS_MAX_MCS; ri.mcs++) {
++				rix = ps_cmn_calc_rix(&ri);
++				printf("%5s | %3u | %3u | %3u | %10u | %10u | %10u\n",
++				       ps_cmn_bw_str(ri.bw),
++				       ri.nss + 1,
++				       ri.mcs,
++				       rix,
++				       cmd->u.peer_tx_stats.get.stats[rix].attempts,
++				       cmd->u.peer_tx_stats.get.stats[rix].success,
++				       cmd->u.peer_tx_stats.get.stats[rix].ppdus);
++			}
++		}
++	}
++
++	printf("sojourn:\n");
++	printf("%10s %10s %20s %20s\n",
++	       "tid",
++	       "ave",
++	       "sum",
++	       "num");
++	for (tid = 0; tid < PS_MAX_TID; tid++) {
++		printf("%10d %10lu %20llu %20lu\n",
++		       tid,
++		       cmd->u.peer_tx_stats.get.sojourn[tid].ave_sojourn_msec,
++		       cmd->u.peer_tx_stats.get.sojourn[tid].sum_sojourn_msec,
++		       cmd->u.peer_tx_stats.get.sojourn[tid].num_sojourn_mpdus);
++	}
++}
++
++
++static void survey_chan_prepare(int argc,
++				const char **argv,
++				struct ps_uapi_ioctl *cmd)
++{
++	cmd->cmd = PS_UAPI_IOCTL_CMD_SURVEY_CHAN;
++}
++
++static void survey_chan_handle(const struct ps_uapi_ioctl *cmd)
++{
++	int i;
++	u16 freq;
++	u32 total;
++	u32 tx;
++	u32 rx;
++	u32 busy;
++
++	for (i = 0; i < ARRAY_SIZE(cmd->u.survey_chan.get.channels); i++) {
++		freq = cmd->u.survey_chan.get.channels[i].freq;
++
++		if (freq == 0)
++			break;
++
++		printf("freq %hu ", freq);
++
++		total = cmd->u.survey_chan.get.channels[i].total;
++		tx = cmd->u.survey_chan.get.channels[i].tx;
++		rx = cmd->u.survey_chan.get.channels[i].rx;
++		busy = cmd->u.survey_chan.get.channels[i].busy;
++
++		total /= 100;
++
++		if (total == 0) {
++			printf("undefined\n");
++			continue;
++		}
++
++		tx /= total;
++		rx /= total;
++		busy /= total;
++
++		printf("tx %u%% rx %u%% busy %u%% (raw tx %u rx %u busy %u total %u)\n",
++		       tx,
++		       rx,
++		       busy,
++		       cmd->u.survey_chan.get.channels[i].tx,
++		       cmd->u.survey_chan.get.channels[i].rx,
++		       cmd->u.survey_chan.get.channels[i].busy,
++		       cmd->u.survey_chan.get.channels[i].total);
++	}
++}
++
++static void survey_bss_prepare(int argc,
++			       const char **argv,
++			       struct ps_uapi_ioctl *cmd)
++{
++	cmd->cmd = PS_UAPI_IOCTL_CMD_SURVEY_BSS;
++}
++
++static void survey_bss_handle(const struct ps_uapi_ioctl *cmd)
++{
++	u64 total;
++	u64 tx;
++	u64 rx;
++	u64 rx_bss;
++	u64 busy;
++	u64 busy_ext;
++
++	total = cmd->u.survey_bss.get.total;
++	tx = cmd->u.survey_bss.get.tx;
++	rx = cmd->u.survey_bss.get.rx;
++	rx_bss = cmd->u.survey_bss.get.rx_bss;
++	busy = cmd->u.survey_bss.get.busy;
++	busy_ext = cmd->u.survey_bss.get.busy_ext;
++
++	printf("raw cc tx %llu rx %llu rx_bss %llu busy %llu busy_ext %llu total %llu\n",
++	       tx,
++	       rx,
++	       rx_bss,
++	       busy,
++	       busy_ext,
++	       total);
++
++	total /= 100;
++	if (total == 0)
++		return;
++
++	tx /= total;
++	rx /= total;
++	rx_bss /= total;
++	busy /= total;
++	busy_ext /= total;
++
++	printf("percent tx %llu%% rx %llu%% rx_bss %llu%% busy %llu%% busy_ext %llu%%\n",
++	       tx,
++	       rx,
++	       rx_bss,
++	       busy,
++	       busy_ext);
++}
++
++static void q_util_prepare(int argc,
++			   const char **argv,
++			   struct ps_uapi_ioctl *cmd)
++{
++	cmd->cmd = PS_UAPI_IOCTL_CMD_Q_UTIL;
++}
++
++static void q_util_handle(const struct ps_uapi_ioctl *cmd)
++{
++	int cnt;
++	int i;
++
++	cnt = sizeof(cmd->u.q_util.get.q) /
++	      sizeof(cmd->u.q_util.get.q[0]);
++
++	printf("samples = %llu\n", cmd->u.q_util.get.cnt);
++	for (i = 0; i < cnt; i++)
++		printf("hwq %2d = %10llu\n", i, cmd->u.q_util.get.q[i]);
++}
++
++static const char *const svcs[] = {
++	[PS_UAPI_IOCTL_SVC_PEER_RX_STATS] = "peer_rx_stats",
++	[PS_UAPI_IOCTL_SVC_PEER_TX_STATS] = "peer_tx_stats",
++	[PS_UAPI_IOCTL_SVC_SOJOURN] = "sojourn",
++	[PS_UAPI_IOCTL_SVC_SURVEY] = "survey",
++	[PS_UAPI_IOCTL_SVC_Q_UTIL] = "q_util",
++};
++
++static void svc_prepare(int argc,
++		        const char **argv,
++		        struct ps_uapi_ioctl *cmd)
++{
++	int err;
++	int i;
++
++	cmd->cmd = PS_UAPI_IOCTL_CMD_SVC;
++	cmd->u.svc.set.modify = 0;
++
++	switch (argc) {
++	case 3:
++		printf("known services:\n");
++		for (i = 0; i < ARRAY_SIZE(svcs); i++)
++			printf("  %s\n", svcs[i]);
++		die("nothing to do");
++		break;
++	case 5:
++		cmd->u.svc.set.modify = 1;
++
++		err = sscanf(argv[4], "%i", &cmd->u.svc.set.enabled);
++		if (err != 1)
++			die("%s: not a number", argv[4]);
++		/* fall through */
++	case 4:
++		for (i = 0; i < ARRAY_SIZE(svcs); i++)
++			if (!strcmp(argv[3], svcs[i]))
++				break;
++
++		if (i == ARRAY_SIZE(svcs))
++			die("%s: unknown service name", argv[3]);
++
++		cmd->u.svc.set.svc = i;
++		break;
++	default:
++		die("too many arguments");
++		break;
++	}
++}
++
++static void svc_handle(const struct ps_uapi_ioctl *cmd)
++{
++	int cnt;
++	int i;
++
++	if (cmd->u.svc.get.svc >= ARRAY_SIZE(svcs))
++		die("%d: unknown service number", cmd->u.svc.get.svc);
++
++	printf("%s: %s\n",
++	       svcs[cmd->u.svc.get.svc],
++	       cmd->u.svc.get.enabled ? "enabled" : "disabled");
++}
++
++struct command {
++	const char *name;
++	const char *usage;
++	void (*prepare)(int argc,
++			const char **argv,
++			struct ps_uapi_ioctl *cmd);
++	void (*handle)(const struct ps_uapi_ioctl *cmd);
++};
++
++static const struct command commands[] = {
++	{
++		.name = "peer_rx_stats",
++		.usage = "<xx:yy:zz:aa:bb:cc>",
++		.prepare = peer_rx_stats_prepare,
++		.handle = peer_rx_stats_handle,
++	},
++	{
++		.name = "survey_chan",
++		.usage = "",
++		.prepare = survey_chan_prepare,
++		.handle = survey_chan_handle,
++	},
++	{
++		.name = "survey_bss",
++		.usage = "",
++		.prepare = survey_bss_prepare,
++		.handle = survey_bss_handle,
++	},
++	{
++		.name = "peer_tx_stats",
++		.usage = "<xx:yy:zz:aa:bb:cc>",
++		.prepare = peer_tx_stats_prepare,
++		.handle = peer_tx_stats_handle,
++	},
++	{
++		.name = "q_util",
++		.usage = "",
++		.prepare = q_util_prepare,
++		.handle = q_util_handle,
++	},
++	{
++		.name = "svc",
++		.usage = "[<service name> [0|1]]",
++		.prepare = svc_prepare,
++		.handle = svc_handle,
++	},
++};
++
++static void usage(const char *name, const char *reason, ...)
++{
++	int i;
++	va_list args;
++
++	fprintf(stderr, "usage error: ");
++	va_start(args, reason);
++	vfprintf(stderr, reason, args);
++	va_end(args);
++	fprintf(stderr, "\n\n");
++
++	fprintf(stderr,
++		"usage: %s <wifiX> <command> [arguments..]\n"
++		"commands:\n",
++		name);
++
++	for (i = 0; i < ARRAY_SIZE(commands); i++)
++		fprintf(stderr, "  %s %s\n",
++			commands[i].name,
++			commands[i].usage);
++
++	exit(EXIT_FAILURE);
++}
++
++int main(int argc, const char **argv)
++{
++	struct iwreq iwr = {};
++	struct ps_uapi_ioctl iocmd = {};
++	const struct command *cmd = NULL;
++	int i;
++	int err;
++	int fd;
++
++	fd = socket(AF_INET, SOCK_DGRAM, 0);
++	if (fd < 0)
++		die("socket() failed: %d", fd);
++
++	if (argc < 2)
++		usage(argv[0], "missing argument: interface");
++	if (argc < 3)
++		usage(argv[0], "missing argument: command");
++
++	if (!strstr(argv[1], "wifi"))
++		fprintf(stderr,
++			"warning: %s doesn't look like wifi interface\n",
++			argv[1]);
++
++	strncpy(iwr.ifr_ifrn.ifrn_name, argv[1], strlen(argv[1]) + 1);
++
++	iwr.u.data.pointer = &iocmd;
++	iwr.u.data.length = PS_UAPI_IOCTL_SIZE;
++
++	for (i = 0; i < ARRAY_SIZE(commands); i++) {
++		if (!strcmp(commands[i].name, argv[2])) {
++			cmd = &commands[i];
++			break;
++		}
++	}
++
++	if (!cmd)
++		usage(argv[0],
++		      "invalid argument: command '%s' not found",
++		      argv[2]);
++
++	cmd->prepare(argc, argv, &iocmd);
++	err = ioctl(fd, PS_UAPI_IOCTL_SET, &iwr);
++	if (err < 0)
++		die("ioctl(SET) failed: %d", err);
++
++	err = ioctl(fd, PS_UAPI_IOCTL_GET, &iwr);
++	if (err < 0)
++		die("ioctl(GET) failed: %d", err);
++
++	cmd->handle(&iocmd);
++
++	return 0;
++}

@@ -1,0 +1,19 @@
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -44,6 +44,7 @@
+ #define ONEMBPS 1000
+ #define HIGHEST_BASIC_RATE 24000
+ #define THREE_HUNDRED_FIFTY_MBPS 350000
++#define EIGHT_HUNDRED_SIXTY_SIX_MBPS 866000
+ 
+ extern int ol_ath_ucfg_get_user_postion(wlan_if_t vaphandle, u_int32_t aid);
+ extern int ol_ath_ucfg_get_peer_mumimo_tx_count(wlan_if_t vaphandle, u_int32_t aid);
+@@ -1978,7 +1979,7 @@ int ieee80211_ucfg_setparam(wlan_if_t va
+         * value is rate in units of Kbps
+         * min: 1Mbps max: 350Mbps
+         */
+-        if (value < ONEMBPS || value > THREE_HUNDRED_FIFTY_MBPS)
++        if (value < ONEMBPS || value > EIGHT_HUNDRED_SIXTY_SIX_MBPS)
+             retv = -EINVAL;
+         else {
+             retv = wlan_set_param(vap, IEEE80211_MCAST_RATE, value);

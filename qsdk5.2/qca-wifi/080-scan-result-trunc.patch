@@ -1,0 +1,309 @@
+The maximum ioctl data length is 16-bits, which can sometimes be
+too small to fit all scan results when there are many neighboring
+access points present.
+
+This patch checks when the maximum length has been requested, and
+truncates the results instead of returning E2BIG.
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -1769,6 +1769,7 @@ struct iwscanreq
+     char            *start_ev;
+     int         mode;
+     struct iw_request_info *info;
++    bool        skip_2big;
+ };
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION (2,6,27)
+@@ -1867,7 +1868,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+     req->start_ev = current_ev;
+ 
+     if (current_ev >= end_buf) {
+-        return E2BIG;
++        goto toobig;
+     }
+     /* WPA/!WPA sort criteria */
+ 
+@@ -1896,7 +1897,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+     /* We ran out of space in the buffer. */
+     if (last_ev == current_ev) {
+-        return E2BIG;
++        goto toobig;
+     }
+ 
+     if (se_ssid != NULL) {
+@@ -1913,7 +1914,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+     /* We ran out of space in the buffer. */
+     if (last_ev == current_ev) {
+-        return E2BIG;
++        goto toobig;
+     }
+ 
+     if ((se_opmode == IEEE80211_M_STA) || (se_opmode == IEEE80211_M_IBSS)) {
+@@ -1926,7 +1927,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+             end_buf, &iwe, IW_EV_UINT_LEN);
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+     }
+ 
+@@ -1940,7 +1941,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+     /* We ran out of space in the buffer. */
+     if (last_ev == current_ev) {
+-        return E2BIG;
++        goto toobig;
+     }
+ 
+     OS_MEMZERO(&iwe, sizeof(iwe));
+@@ -1952,7 +1953,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+     /* We ran out of space in the buffer. */
+     if (last_ev == current_ev) {
+-        return E2BIG;
++        goto toobig;
+     }
+ 
+     OS_MEMZERO(&iwe, sizeof(iwe));
+@@ -1968,7 +1969,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+     /* We ran out of space in the buffer. */
+     if (last_ev == current_ev) {
+-        return E2BIG;
++        goto toobig;
+     }
+ 
+     OS_MEMZERO(&iwe, sizeof(iwe));
+@@ -2004,7 +2005,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+     } else {
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev)
+-            return E2BIG;
++            goto toobig;
+     }
+ 
+ #if WIRELESS_EXT > 14
+@@ -2017,7 +2018,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+     /* We ran out of space in the buffer. */
+     if (last_ev == current_ev) {
+-        return E2BIG;
++        goto toobig;
+     }
+ 
+     if (se_rsn_ie != NULL) {
+@@ -2027,7 +2028,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         OS_MEMZERO(&iwe, sizeof(iwe));
+         if ((se_rsn_ie[1] + 2) > MAX_IE_LENGTH) {
+-            return E2BIG;
++            goto toobig;
+         }
+         OS_MEMCPY(buf, se_rsn_ie, se_rsn_ie[1] + 2);
+         iwe.cmd = IWEVGENIE;
+@@ -2048,7 +2049,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+             /* We ran out of space in the buffer */
+             if (last_ev == current_ev) {
+-            return E2BIG;
++                goto toobig;
+             }
+         }
+ 
+@@ -2067,7 +2068,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+             /* We ran out of space in the buffer */
+             if (last_ev == current_ev) {
+-              return E2BIG;
++                goto toobig;
+             }
+         }
+ 
+@@ -2079,7 +2080,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ #ifdef IWEVGENIE
+         OS_MEMZERO(&iwe, sizeof(iwe));
+         if ((se_wpa_ie[1] + 2) > MAX_IE_LENGTH) {
+-            return E2BIG;
++            goto toobig;
+         }
+         OS_MEMCPY(buf, se_wpa_ie, se_wpa_ie[1] + 2);
+         iwe.cmd = IWEVGENIE;
+@@ -2098,7 +2099,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+             /* We ran out of space in the buffer. */
+             if (last_ev == current_ev) {
+-            return E2BIG;
++                goto toobig;
+             }
+         }
+ 
+@@ -2119,7 +2120,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+     } else if (se_wmeinfo != NULL) {
+         static const char wme_leader[] = "wme_ie=";
+@@ -2137,7 +2138,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+     }
+ 	if (se_phymode != 0) {
+@@ -2179,7 +2180,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+ 	 /* We ran out of space in the buffer. */
+ 	 if (last_ev == current_ev) {
+-		 return E2BIG;
++		 goto toobig;
+ 	 }
+ 	}
+     if (se_ath_ie != NULL) {
+@@ -2198,7 +2199,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+     }
+     if (se_dtimperiod != 0) {
+@@ -2211,7 +2212,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+     }
+ 
+@@ -2221,7 +2222,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ #if WIRELESS_EXT > 20
+         OS_MEMZERO(&iwe, sizeof(iwe));
+         if ((se_wps_ie[1] + 2) > MAX_IE_LENGTH) {
+-            return E2BIG;
++            goto toobig;
+         }
+         OS_MEMCPY(buf, se_wps_ie, se_wps_ie[1] + 2);
+         iwe.cmd = IWEVGENIE;
+@@ -2239,7 +2240,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+             /* We ran out of space in the buffer */
+             if (last_ev == current_ev) {
+-                return E2BIG;
++                goto toobig;
+             }
+         }
+     }
+@@ -2278,7 +2279,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+                         if (ie_buf_len)
+                             OS_FREE(ie_buf);
+                         OS_FREE(p2p_buf);
+-                        return E2BIG;
++                        goto toobig;
+                     }
+                 }
+             }
+@@ -2316,7 +2317,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+ #ifdef  IWEVGENIE
+                 if ((htinfo.hi_len + 2) > MAX_IE_LENGTH) {
+-                    return E2BIG;
++                    goto toobig;
+                 }
+ 
+                 OS_MEMCPY(buf, &htinfo, sizeof(htinfo));
+@@ -2328,7 +2329,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+                 }
+ 
+                 if (last_ev == current_ev) {
+-                    return E2BIG;
++                    goto toobig;
+                 }
+             }
+ #else       /* IWEVGENIE */
+@@ -2343,7 +2344,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+ #ifdef  IWEVGENIE
+                 if ((se_vhtop[1] + 2) > MAX_IE_LENGTH) {
+-                    return E2BIG;
++                    goto toobig;
+                 }
+ 
+                 OS_MEMCPY(buf, se_vhtop, se_vhtop[1] + 2);
+@@ -2355,7 +2356,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+                 }
+ 
+                 if (last_ev == current_ev) {
+-                    return E2BIG;
++                    goto toobig;
+                 }
+             }
+ 
+@@ -2376,7 +2377,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+         OS_MEMZERO(&iwe, sizeof(iwe));
+         last_ev = current_ev;
+@@ -2387,13 +2388,19 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+ 
+         /* We ran out of space in the buffer. */
+         if (last_ev == current_ev) {
+-            return E2BIG;
++            goto toobig;
+         }
+     }
+ #endif
+     req->current_ev = current_ev;
+ 
+     return 0;
++
++toobig:
++    /* Scan entry is too big for buffer. See if we should silently skip or not */
++    if (req->skip_2big)
++        return 0;
++    return E2BIG;
+ }
+ 
+ static int
+@@ -2437,6 +2444,17 @@ ieee80211_ioctl_giwscan(struct net_devic
+     }
+ 
+     /*
++     * Max request length is 0xFFFF due to 16-bit length field, so just truncate results
++     * if this is the size already requested.
++     */
++    if (data->length == 0xFFFF) {
++        req.skip_2big = true;
++    }
++    else {
++        req.skip_2big = false;
++    }
++
++    /*
+     * Do two passes to insure WPA/non-WPA scan candidates
+     * are sorted to the front.  This is a hack to deal with
+     * the wireless extensions capping scan results at
+--- a/os/linux/tools/wlanconfig.c
++++ b/os/linux/tools/wlanconfig.c
+@@ -2458,7 +2458,7 @@ list_stations_human_format(const char *i
+ static void
+ list_scan(const char *ifname)
+ {
+-	uint8_t buf[24*1024];
++	uint8_t buf[65535];
+ 	struct iwreq iwr;
+ 	char ssid[14];
+ 	uint8_t *cp;

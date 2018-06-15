@@ -1,0 +1,42 @@
+--- a/os/linux/src/osif_umac.c
++++ b/os/linux/src/osif_umac.c
+@@ -3839,6 +3839,8 @@ static void osif_vap_setup(wlan_if_t vap
+     if (vap->iv_ic->ic_nl_handle)
+         ieee80211_nl_register_handler(vap, osif_mu_report, osif_nl_scan_evhandler);
+ 
++    ieee80211_ic_doth_set(vap->iv_ic);
++
+     switch(opmode) {
+     case IEEE80211_M_STA:
+     case IEEE80211_M_P2P_CLIENT:
+@@ -3874,6 +3876,7 @@ static void osif_vap_setup(wlan_if_t vap
+             wlan_p2p_client_register_event_handlers(osifp->p2p_client_handle, (void *)osifp, osif_p2p_dev_event_handler);
+         }
+ #endif
++        ieee80211_ic_2g_csa_set(vap->iv_ic);
+         break;
+ 
+ #if UMAC_SUPPORT_IBSS
+--- a/umac/mlme/ieee80211_mgmt_sta.c
++++ b/umac/mlme/ieee80211_mgmt_sta.c
+@@ -391,7 +391,7 @@ void ieee80211_recv_beacon_sta(struct ie
+         /*
+          * check for spectrum management
+          */
+-        if (capinfo & IEEE80211_CAPINFO_SPECTRUM_MGMT) {
++        if ((capinfo & IEEE80211_CAPINFO_SPECTRUM_MGMT) || (ieee80211_ic_2g_csa_is_set(ic))) {
+             chanie  = (struct ieee80211_channelswitch_ie *)         ieee80211_scan_entry_csa(scan_entry);
+             echanie = (struct ieee80211_extendedchannelswitch_ie *) ieee80211_scan_entry_xcsa(scan_entry);
+             widebwie = (struct ieee80211_ie_wide_bw_switch *) ieee80211_scan_entry_widebw(scan_entry);
+--- a/umac/regdmn/ieee80211_regdmn.c
++++ b/umac/regdmn/ieee80211_regdmn.c
+@@ -93,7 +93,8 @@ ieee80211_update_spectrumrequirement(str
+     struct ieee80211_node *ni = vap->iv_bss;
+     IEEE80211_COUNTRY_ENTRY curCountry;
+ 
+-    ieee80211_ic_doth_clear(ic);
++    if (!ieee80211_ic_2g_csa_is_set(vap->iv_ic))
++        ieee80211_ic_doth_clear(ic);
+ 
+     if (ic->ic_country.isMultidomain == 0) {
+         if (!IEEE80211_IS_COUNTRYIE_ENABLED(ic)) {

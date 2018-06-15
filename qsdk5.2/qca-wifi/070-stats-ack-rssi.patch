@@ -1,0 +1,364 @@
+This adds a new binary subioctl that exports last
+4 ack rssi values, their age expressed in relative
+number of seconds (capped to 255) and a packet
+counter to allow userspace noticing
+stalls/updates.
+
+All of this is expressed as 3 host-endian
+integers. RSSI value and age are 8-bit wide with
+most recent values in LSB.
+
+This can be used to get fairly stable rssi values
+that don't need compensation. In comparison
+high-rate data packets need compenstation relative
+to their MCS, BW and NSS/STBC.
+
+If there's is no traffic one can initiate data
+traffic to target node (if its L3 unicast address
+is known) or via nullfunc ping-pong (available on
+piranha builds and doable with "wifitool":
+
+Example use:
+
+ root@pir0:~# wlanconfig ap1 list sta
+ ADDR               AID CHAN TXRATE RXRATE RSSI IDLE  TXSEQ  RXSEQ  CAPS        ACAPS     ERP    STATE MAXRATE(DOT11) HTCAPS ASSOCTIME    IEs   MODE PSMODE
+ d0:05:2a:36:52:8b    1    1 294M      4M   74    0    127    2048  EPSs         0          f              0            WPS 01:48:02 RSN WME IEEE80211_MODE_11NG_HT40  0
+ root@pir0:~# iwpriv ap1 glastackrssi $(echo d0:05:2a:36:52:8b | tr ':' '\n' | sed 's/^/0x/');
+ ap1       glastackrssi:74  75  74  73  255  2  3  63  0  0  0  135
+ root@pir0:~# wifitool ap1 getrssi d0:05:2a:36:52:8b
+ root@pir0:~# iwpriv ap1 glastackrssi $(echo d0:05:2a:36:52:8b | tr ':' '\n' | sed 's/^/0x/');
+ ap1       glastackrssi:75  74  73  77  2  3  68  1  0  0  0  136
+
+Explanation:
+                         these are actually 3 host-endian integers
+                        in this example they are big-endian because
+                         the piranha's host cpu is big-endian MIPS
+                                _____________|____________
+                               /             |            \
+                              |              |            |
+                         _____|______    ____|____    ____|_____
+                        |            |  |         |  |          |
+ ap1       glastackrssi:75  74  73  77  2  3  68  1  0  0  0  136
+                        ^^^^^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^
+                              |              |            |
+                     last 4 rssi values      |      sample counter
+                                             |
+                                     last 4 rssi's age
+
+                            the "77" rssi is 1 second old
+                                     ______|______
+                                    /             \
+                                    |             |
+ ap1       glastackrssi:75  74  73  77  2  3  68  1  0  0  0  136
+                                 |             |
+                                 \____________/
+                                       |
+                             the 2nd most recent rssi of "73"
+                             is 68 seconds old *in relation*
+                             to the 1st ("77") therefore it is
+                             68 + 1 seconds old *now*
+
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -1106,6 +1106,7 @@ struct ieee80211_ops {
+     u_int8_t     (*get_enable_min_rssi)(ieee80211_handle_t ieee);
+     int          (*set_min_rssi)(ieee80211_handle_t ieee, int rssi);
+     int          (*get_min_rssi)(ieee80211_handle_t ieee);
++    void         (*update_ack_rssi)(ieee80211_node_t node, int rssi);
+ };
+ 
+ /**
+--- a/lmac/ath_dev/ath_xmit.c
++++ b/lmac/ath_dev/ath_xmit.c
+@@ -3422,6 +3422,9 @@ ath_tx_update_stats(struct ath_softc *sc
+         txstatus.rssi = ts->ts_rssi;
+         txstatus.flags=0;
+ 
++        if (!(bf->bf_flags & HAL_TXDESC_NOACK))
++            sc->sc_ieee_ops->update_ack_rssi(an->an_node, ts->ts_rssi);
++
+         if (sc->sc_hashtsupport) {
+            /*
+             * Update 11n stats
+--- a/offload/wlan/lmac_offload_if/ol_if_stats.c
++++ b/offload/wlan/lmac_offload_if/ol_if_stats.c
+@@ -1188,6 +1188,7 @@ ol_ath_rssi_cb(struct ol_ath_softc_net80
+         }
+ #undef WMI_INST_STATS_VALID_RSSI_MAX
+ #endif
++        ieee80211_update_ack_rssi(ni, ev->iRSSI);
+         ieee80211_free_node(ni);
+     }
+     return 0;
+@@ -1662,6 +1663,7 @@ process_tx_stats(struct ol_txrx_pdev_t *
+                 return -1;
+             }
+ 
++            ieee80211_update_ack_rssi(ni, txrx_pdev->tx_stats.ave_rssi);
+             diff = peer->peer_data_stats.discard_cnt -  ni->ni_stats.ns_tx_discard ;
+             vap->iv_unicast_stats.ims_tx_discard += diff;
+             ni->ni_stats.ns_tx_discard = (u_int32_t)peer->peer_data_stats.discard_cnt;
+@@ -1727,6 +1729,8 @@ process_tx_stats(struct ol_txrx_pdev_t *
+     if (pl_hdr.log_type == PKTLOG_TYPE_TX_STAT) {
+         void *tx_ppdu_status_desc = (void *)data + pl_dev->pktlog_hdr_size;
+ 
++        txrx_pdev->tx_stats.ave_rssi = *((u_int32_t *)tx_ppdu_status_desc + 16 + 11) & 0xff;
++
+         /* If no_ack, no way to know if tx has error so ignore. If !tx_ok, incr tx_error.  */
+         /* TODO: Define ole_stats and ole_desc strcut and get stats from ole_stats.*/
+         if ( !txrx_pdev->tx_stats.no_ack &&
+@@ -2107,6 +2111,107 @@ ol_if_stats_collect_plume_tx_stats(struc
+     ni->ps_kapi_peer_tx_stats.stats[rix].ppdus += ppdus;
+ }
+ 
++static uint8_t ol_if_stats_sum_rssi(uint8_t *rssi, int num)
++{
++    /* This saves doing some expensive computations one would normally need to
++     * go through to do decibel arithmetics. The precision is good enough.
++     * Roughly 25% samples are rounded up too much and exceed the hardware's
++     * combined signal by 1.
++     *
++     * The db_map is 6 left bitshifted map that maps input decibel difference
++     * to output decibel difference. E.g.
++     *
++     *  a = 10db
++     *  b = 12db
++     *  d = max(a, b) - min(a, b) = 12 - 10 = 2
++     *  map[d] = ((a + b) - max(a, b)) * (2**6) = (14.1 - 12) * 64 = 2.1 * 64 = 134.4
++     *  map[2] = 134
++     *
++     * QED
++     */
++    static const uint8_t db_map[] = { 192, 160, 134, 115, 96, 76, 64, 51, 38, 32, 25, 19, 19, 12, 12, 6 };
++    uint16_t rssi_ave;
++    int i;
++    int max_i = -1;
++    int delta;
++
++    for (i = 0; i < num; i++) {
++        if (rssi[i] & 0x80)
++            continue;
++
++        if (max_i == -1 || rssi[max_i] < rssi[i])
++            max_i = i;
++    }
++
++    if (max_i == -1)
++        return 0x80;
++
++    rssi_ave = rssi[max_i];
++    rssi_ave <<= 6;
++
++    for (i = 0; i < num; i++) {
++        if (i == max_i)
++            continue;
++
++        if (rssi[i] & 0x80)
++            continue;
++
++        delta = (rssi_ave >> 6) - rssi[i];
++        if (delta >= ARRAY_SIZE(db_map))
++            continue;
++
++        rssi_ave += db_map[delta];
++    }
++
++    rssi_ave >>= 6;
++    return rssi_ave;
++}
++
++static uint8_t ol_if_stats_compute_ave_rssi(uint32_t *src)
++{
++    uint8_t rssi[4];
++    uint8_t rssi_ave;
++    int i;
++
++    /* ppdu_status descriptor has 16 per-chain/bw samples plus one extra that
++     * is dubbed as "ack_rssi_ave" (it's actually a sum as far as decibels are
++     * concerned).
++     *
++     * However hardware only seems to be considering pri20 samples when its
++     * computing the average signal value. Mimic this so both values can be
++     * used interchangably.
++     */
++    rssi[0] = (src[0] >> 24) & 0xff;
++    rssi[1] = (src[1] >> 24) & 0xff;
++    rssi[2] = (src[2] >> 24) & 0xff;
++    rssi[3] = (src[3] >> 24) & 0xff;
++
++    for (i = 0; i < 4; i++)
++        if (rssi[i] > 0x80)
++            rssi[i] = 0;
++
++    rssi_ave = ol_if_stats_sum_rssi(rssi, 4);
++
++    return rssi_ave;
++}
++
++static void ol_if_stats_collect_plume_ack_rssi(struct ieee80211com *ic,
++                                               struct ieee80211_node *ni,
++                                               ppdu_common_stats_v3 *in,
++                                               int version)
++{
++    uint8_t ave_rssi;
++
++    if (version < 1)
++        return;
++
++    ave_rssi = ol_if_stats_compute_ave_rssi(in->rssi);
++    if (ave_rssi == 0x80)
++        return;
++
++    ieee80211_update_ack_rssi(ni, ave_rssi);
++}
++
+ #if ENHANCED_STATS
+ #define PPDU_STATS_TX_ERROR_MASK 0xFEC
+ int ol_ath_enh_stats_handler(struct ol_txrx_pdev_t *txrx_pdev, uint32_t* msg_word, uint32_t msg_len)
+@@ -2253,6 +2358,7 @@ int ol_ath_enh_stats_handler(struct ol_t
+             /* */
+ 
+             ol_if_stats_collect_plume_tx_stats(ic, ni, ppdu_stats, ts->version);
++            ol_if_stats_collect_plume_ack_rssi(ic, ni, ppdu_stats, ts->version);
+ 
+             if (peer->bss_peer) {
+                 ni->ni_stats.ns_tx_mcast += num_msdus;
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1488,6 +1488,7 @@ enum {
+     IEEE80211_PARAM_CSA_DEAUTH,
+     IEEE80211_PARAM_Q_UTIL_INTERVAL_MS,
+     IEEE80211_PARAM_LAST_BCN_RSSI,
++    IEEE80211_PARAM_LAST_ACK_RSSI,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14369,6 +14369,9 @@ static const struct iw_priv_args ieee802
+     { IEEE80211_PARAM_LAST_BCN_RSSI,
+       IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | IEEE80211_ADDR_LEN,
+       IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | 12, "glastbcnrssi" },
++    { IEEE80211_PARAM_LAST_ACK_RSSI,
++      IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | IEEE80211_ADDR_LEN,
++      IW_PRIV_TYPE_BYTE | IW_PRIV_SIZE_FIXED | 12, "glastackrssi" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/base/ieee80211_node.c
++++ b/umac/base/ieee80211_node.c
+@@ -3585,3 +3585,23 @@ u_int32_t wlan_node_get_last_txpower(wla
+ {
+     return node->ni_ic->ic_node_get_last_txpower(node);
+ }
++
++void
++ieee80211_update_ack_rssi(struct ieee80211_node *ni, int rssi)
++{
++    unsigned long age;
++
++    if (rssi & 0x80)
++        return;
++
++    age = jiffies - ni->ni_last_ack_jiffies;
++    age = jiffies_to_msecs(age) / MSEC_PER_SEC;
++    if (age > 0xff)
++        age = 0xff;
++
++    ACCESS_ONCE(ni->ni_last_ack_rssi) = (ni->ni_last_ack_rssi << 8) | rssi;
++    ACCESS_ONCE(ni->ni_last_ack_age) = (ni->ni_last_ack_age << 8) | age;
++    ACCESS_ONCE(ni->ni_last_ack_jiffies) = jiffies;
++    ACCESS_ONCE(ni->ni_last_ack_cnt) = ni->ni_last_ack_cnt + 1;
++}
++EXPORT_SYMBOL(ieee80211_update_ack_rssi);
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -7952,6 +7952,11 @@ ath_modify_bcn_rate(struct ieee80211vap
+     return scn->sc_ops->modify_bcn_rate(scn->sc_dev, avn->av_if_id, vap->iv_bcn_rate);
+ }
+ 
++static void ath_net80211_update_ack_rssi(ieee80211_node_t node, int rssi)
++{
++    ieee80211_update_ack_rssi(node, rssi);
++}
++
+ struct ieee80211_ops net80211_ops = {
+     ath_get_netif_settings,                 /* get_netif_settings */
+     ath_mcast_merge,                        /* netif_mcast_merge  */
+@@ -8136,6 +8141,7 @@ struct ieee80211_ops net80211_ops = {
+     ath_net80211_get_enable_min_rssi,            /* get_enable_min_rssi */
+     ath_net80211_set_min_rssi,                   /* set_min_rssi */
+     ath_net80211_get_min_rssi,                   /* get_min_rssi */
++    .update_ack_rssi = ath_net80211_update_ack_rssi,
+ };
+ 
+ static void
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -573,6 +573,10 @@ typedef struct ieee80211_node {
+     unsigned long ni_last_bcn_age;
+     unsigned long ni_last_bcn_cnt;
+     unsigned long ni_last_bcn_jiffies;
++    unsigned long ni_last_ack_rssi;
++    unsigned long ni_last_ack_age;
++    unsigned long ni_last_ack_cnt;
++    unsigned long ni_last_ack_jiffies;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 
+@@ -1357,6 +1361,7 @@ ieee80211_node_get_hbr_block_state(struc
+     ( 0 )
+ 
+ int wlan_node_alloc_aid_bitmap(wlan_if_t vap, u_int16_t old_len);
++void ieee80211_update_ack_rssi(struct ieee80211_node *ni, int rssi);
+ 
+ #endif /* end of _ATH_STA_IEEE80211_NODE_H */
+ 
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -4413,6 +4413,35 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+         }
+         break;
+     }
++    case IEEE80211_PARAM_LAST_ACK_RSSI:
++    {
++        struct ieee80211_node *ni;
++        char addr[IEEE80211_ADDR_LEN];
++        unsigned long age;
++        int i;
++
++        for (i = 0; i < sizeof(addr); i++)
++            addr[i] = extra[4 + i];
++
++        ni = ieee80211_find_node(&ic->ic_sta, addr);
++        if (ni) {
++            age = jiffies - ni->ni_last_ack_jiffies;
++            age = jiffies_to_msecs(age) / MSEC_PER_SEC;
++            if (age > 0xff)
++                age = 0xff;
++
++            value[0] = ni->ni_last_ack_rssi;
++            value[1] = ni->ni_last_ack_age;
++            value[1] <<= 8;
++            value[1] |= age;
++            value[2] = ni->ni_last_ack_cnt;
++            ieee80211_free_node(ni);
++            retv = 0;
++        } else {
++            retv = -ENOENT;
++        }
++        break;
++    }
+     case IEEE80211_PARAM_Q_UTIL_INTERVAL_MS:
+         *value = ic->ic_poll_q_util_interval_ms;
+         break;
+--- a/offload/wlan/txrx/include/ol_txrx_types.h
++++ b/offload/wlan/txrx/include/ol_txrx_types.h
+@@ -429,6 +429,7 @@ struct ol_tx_stats {
+     u_int32_t peer_id;
+     u_int32_t seq_num;
+     u_int32_t no_ack;
++    u_int32_t ave_rssi;
+ };
+ 
+ struct targetdef_s;

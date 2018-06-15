@@ -1,0 +1,67 @@
+Subject: [PATCH] add supported rates for 11NGHT40
+
+Driver does not set supported rates for 11NGHT40
+in auto mode. In that case iwpriv commands for
+setting mcast, bcast, mgmt and bcn rates return
+failure. WM uses 11NGHT40 auto mode in default
+configuration.
+Patch contains implementation with easy way to
+maintanance, it is a reason to use goto instruction.
+
+---
+ umac/if_lmac/if_ath.c | 42 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 39 insertions(+), 3 deletions(-)
+
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -7416,6 +7416,8 @@ ath_net80211_rate_setup(ieee80211_handle
+         maxrates = rt->rateCount;
+     }
+ 
++set_rates:
++
+     switch (type) {
+     case NORMAL_RATE:
+         rs = IEEE80211_SUPPORTED_RATES(ic, mode);
+@@ -7445,6 +7447,7 @@ ath_net80211_rate_setup(ieee80211_handle
+     rs->rs_nrates = (u_int8_t)rix;
+     if ((mode == IEEE80211_MODE_11NA_HT20)     || (mode == IEEE80211_MODE_11NG_HT20)      ||
+         (mode == IEEE80211_MODE_11NA_HT40PLUS) || (mode == IEEE80211_MODE_11NA_HT40MINUS) ||
++        (mode == IEEE80211_MODE_11NG_HT40)                                                ||
+         (mode == IEEE80211_MODE_11NG_HT40PLUS) || (mode == IEEE80211_MODE_11NG_HT40MINUS)) {
+         /* supported rates (HT) */
+         rix = 0;
+@@ -7455,6 +7458,11 @@ ath_net80211_rate_setup(ieee80211_handle
+             }
+         }
+         rs->rs_nrates = (u_int8_t)rix;
++        if (mode == IEEE80211_MODE_11NG_HT40PLUS || mode == IEEE80211_MODE_11NG_HT40MINUS) {
++            /* Set also 2Ghz, Auto HT40 mode */
++            mode = IEEE80211_MODE_11NG_HT40;
++            goto set_rates;
++        }
+     }
+ }
+ 
+--- a/umac/base/ieee80211_rateset.c
++++ b/umac/base/ieee80211_rateset.c
+@@ -94,6 +94,7 @@ static const struct ieee80211_rateset ba
+     { 3, { 12, 24, 48     } },      /* IEEE80211_MODE_11NA_HT40MINUS */
+     { 4, {  2,  4, 11, 22 } },      /* IEEE80211_MODE_11NG_HT40PLUS (mixed b/g) */
+     { 4, {  2,  4, 11, 22 } },      /* IEEE80211_MODE_11NG_HT40MINUS (mixed b/g) */
++    { 4, {  2,  4, 11, 22 } },      /* IEEE80211_MODE_11NG_HT40 */
+ };
+ 
+ static const struct ieee80211_rateset basic_rates_all[IEEE80211_MODE_MAX] = {
+@@ -880,6 +881,11 @@ ieee80211_init_rateset(struct ieee80211c
+             &ic->ic_sup_rates[IEEE80211_MODE_11NG_HT40PLUS],
+             IEEE80211_MODE_11NG_HT40PLUS);
+ 
++    if (IEEE80211_SUPPORT_PHY_MODE(ic, IEEE80211_MODE_11NG_HT40))
++        ieee80211_set11gbasicrates(
++            &ic->ic_sup_rates[IEEE80211_MODE_11NG_HT40],
++            IEEE80211_MODE_11NG_HT40);
++
+     if (IEEE80211_SUPPORT_PHY_MODE(ic, IEEE80211_MODE_11NG_HT40MINUS))
+         ieee80211_set11gbasicrates(
+             &ic->ic_sup_rates[IEEE80211_MODE_11NG_HT40MINUS],

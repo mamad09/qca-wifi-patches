@@ -1,0 +1,50 @@
+--- a/hal/linux/Kbuild
++++ b/hal/linux/Kbuild
+@@ -916,7 +916,7 @@ endif # ATH_PYTHON
+ 
+ #endif # end of opt_ah.h
+ # copy opt_ah.h to ath_hal
+-$(shell cp $(OBJDIR)/opt_ah.h $(OBJDIR)/../../os/linux/ath_hal/)
++$(shell cp -a $(OBJDIR)/opt_ah.h $(OBJDIR)/../../os/linux/ath_hal/)
+ 
+ 
+ obj-m += hal.o
+--- a/os/linux/ath_hal/Makefile
++++ b/os/linux/ath_hal/Makefile
+@@ -73,7 +73,7 @@ $(obj)/hal.o:${HAL}/${OS}/obj/${TARGET}/
+ #${UUDECODE} ${HAL}/public/${TARGET}.hal.o.uu
+ 
+ opt_ah.h: ${HAL}/${OS}/obj/${TARGET}/opt_ah.h
+-	cp -f ${HAL}/${OS}/obj/${TARGET}/opt_ah.h opt_ah.h
++	cp -af ${HAL}/${OS}/obj/${TARGET}/opt_ah.h opt_ah.h
+ 
+ # Copy the unstripped version of the driver to /tftpboot/`whoami`/drivers/
+ # if debug is enabled.
+--- a/hal/linux/Makefile.inc
++++ b/hal/linux/Makefile.inc
+@@ -683,7 +683,7 @@ ${OBJDIR}/hal-release.o: ${OBJDIR}/hal.o
+ #	${OBJCOPY} `cat ${OBJDIR}/hal.mangle` ${OBJDIR}/hal-release.o
+ 
+ ${OBJDIR}/hal-symrelease.o: ${OBJDIR}/hal.o
+-	cp ${OBJDIR}/hal.o ${OBJDIR}/hal-symrelease.o
++	cp -a ${OBJDIR}/hal.o ${OBJDIR}/hal-symrelease.o
+ 
+ #
+ # XXX should validate the release to make sure, for example, that AH_DEBUG
+@@ -694,14 +694,14 @@ release: ${OBJDIR}/hal-release.o
+ 	(${SED} -e '1,/^$$/d' ${HAL}/COPYRIGHT; \
+ 	 ${SED} -n -e '/ATH_HAL_VERSION/p' ${HAL}/version.h; \
+ 	 ${UUENCODE} ${OBJDIR}/hal-release.o hal.o) > ${PUBLIC}/${TARGET}.hal.o.uu
+-	cp ${OBJDIR}/opt_ah.h ${PUBLIC}/${TARGET}.opt_ah.h
++	cp -a ${OBJDIR}/opt_ah.h ${PUBLIC}/${TARGET}.opt_ah.h
+ 
+ symrelease: ${OBJDIR}/hal-symrelease.o
+ 	rm -f ${PUBLIC}/${TARGET}.hal.o.uu
+ 	(${SED} -e '1,/^$$/d' ${HAL}/COPYRIGHT; \
+ 	 ${SED} -n -e '/ATH_HAL_VERSION/p' ${HAL}/version.h; \
+ 	 ${UUENCODE} ${OBJDIR}/hal-symrelease.o hal.o) > ${PUBLIC}/${TARGET}.hal.o.uu
+-	cp ${OBJDIR}/opt_ah.h ${PUBLIC}/${TARGET}.opt_ah.h
++	cp -a ${OBJDIR}/opt_ah.h ${PUBLIC}/${TARGET}.opt_ah.h
+ 
+ 
+ ${OBJDIR}/ah.o:	${HAL}/ah.c

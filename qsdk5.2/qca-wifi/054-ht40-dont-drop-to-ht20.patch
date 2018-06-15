@@ -1,0 +1,35 @@
+Plume: We dynamically add and remove VAPs as part of our implementation,
+and we currently want to keep COEXT disabled.  When adding a new interface,
+this code re-enables it and we don't want this.  If we try to disable it every
+time we add a VAP, it causes all VAPs to be restarted, so instead we are
+commenting out this line that automatically enables it when adding a VAP.
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -5193,27 +5193,6 @@ int ieee80211_ucfg_set_phymode(wlan_if_t
+         case IEEE80211_MODE_11NG_HT40PLUS:
+         case IEEE80211_MODE_11NG_HT40MINUS:
+         case IEEE80211_MODE_11NG_HT40:
+-            {
+-                struct ieee80211vap *tmpvap = NULL;
+-                bool ht40_vap_found = false;
+-                /*Check if already any VAP is configured with HT40 mode*/
+-                TAILQ_FOREACH(tmpvap, &ic->ic_vaps, iv_next) {
+-                    if((vap != tmpvap) &&
+-                      ((tmpvap->iv_des_mode == IEEE80211_MODE_11NG_HT40PLUS) ||
+-                      (tmpvap->iv_des_mode == IEEE80211_MODE_11NG_HT40MINUS) ||
+-                      (tmpvap->iv_des_mode == IEEE80211_MODE_11NG_HT40))) {
+-                        ht40_vap_found = true;
+-                        break;
+-                    }
+-                }
+-                /*
+-                * If any VAP is already configured with HT40 Mode
+-                * no need to clear disable coext flag,
+-                * as disable coext flag may be set by other VAP
+-                */
+-                if(!ht40_vap_found)
+-                    ic->ic_flags &= ~IEEE80211_F_COEXT_DISABLE;
+-            }
+             break;
+         default:
+             ic->ic_flags |= IEEE80211_F_COEXT_DISABLE;

@@ -1,0 +1,72 @@
+Peregrine 10.4 FW seems to drop Tx on STA vap
+after CSA. This was triaged to be triggered by
+peer_assoc command. On 10.2 the vap->iv_up()
+sequence was not called. This doesn't seem to
+bother Cascade/Dakota 10.4 FW. Therefore allow
+peer_assoc to be called only once on Peregrine.
+This is a mitigation until QCA patches this up
+properly themselves.
+
+This workaround is intended to skip all but first
+newassoc requests for affected configurations.
+
+While debugging I noticed the following can be
+observed in some scenarios which originally led me
+to think this is vdev_up problem (which was
+patched already). Turns out it was not that but
+pretty close nonetheless:
+
+> [ 2113.814293] [wifi1] FWLOG: [2167546] VDEV_MGR_BMISS_TIMEOUT ( 0x0, 0x0, 0x7d0, 0x210afe )
+> [ 2113.814329] [wifi1] FWLOG: [2167596] VDEV_MGR_BCN_IN_SYNC ( 0x0 )
+> [ 2115.814447] [wifi1] FWLOG: [2169644] VDEV_MGR_BMISS_TIMEOUT ( 0x0, 0x0, 0x7d0, 0x21132e )
+> [ 2115.814483] [wifi1] FWLOG: [2169693] VDEV_MGR_BCN_IN_SYNC ( 0x0 )
+> [ 2117.814599] [wifi1] FWLOG: [2171741] VDEV_MGR_BMISS_TIMEOUT ( 0x0, 0x0, 0x7d0, 0x211b60 )
+> [ 2117.814636] [wifi1] FWLOG: [2171790] VDEV_MGR_BCN_IN_SYNC ( 0x0 )
+--- a/offload/wlan/lmac_offload_if/ol_if_vap.c
++++ b/offload/wlan/lmac_offload_if/ol_if_vap.c
+@@ -2048,6 +2048,21 @@ static int ol_ath_root_authorize(struct
+     return ol_ath_node_set_param(scn, ni->ni_macaddr, WMI_HOST_PEER_AUTHORIZE, authorize, avn->av_if_id);
+ }
+ 
++static int
++ol_if_vap_skip_newassoc(struct ol_ath_softc_net80211 *scn,
++                        struct ieee80211_node *ni)
++{
++    int was_done;
++
++    if (scn->target_type != TARGET_TYPE_AR9888)
++        return 0;
++
++    was_done = ni->ni_newassoc_done;
++    ni->ni_newassoc_done = 1;
++
++    return was_done;
++}
++
+ enum ieee80211_opmode ieee80211_new_opmode(struct ieee80211vap *vap, bool vap_active);
+ static int
+ ol_ath_vap_up(struct ieee80211vap *vap)
+@@ -2070,7 +2085,13 @@ ol_ath_vap_up(struct ieee80211vap *vap)
+             ol_ath_vap_set_param(vap, IEEE80211_VHT_SUBFEE, 0);
+             /* Send the assoc id, negotiated capabilities & rateset to the target */
+             aid = IEEE80211_AID(ni->ni_associd);
++            if (ol_if_vap_skip_newassoc(scn, ni)) {
++                printk("%s: skipping newassoc of %pM on %s\n",
++                       __func__, ni->ni_macaddr, ni->ni_vap->iv_netdev_name);
++                goto skip_newassoc;
++            }
+             ol_ath_net80211_newassoc(ni, 1);
++skip_newassoc:
+ 
+             /* Set the beacon interval of the bss */
+             ol_ath_vap_set_param(vap, IEEE80211_BEACON_INTVAL, ni->ni_intval);
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -587,6 +587,7 @@ typedef struct ieee80211_node {
+ #endif
+     int32_t ni_rssi_ave;
+     bool        is_ft_reassoc;
++    bool        ni_newassoc_done;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 

@@ -1,0 +1,17 @@
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -5010,6 +5010,14 @@ static void ol_vap_restart_iter_func(voi
+     int waitcnt = 0;
+     bool disable_hw_ack = false;
+ 
++    if (!ieee80211_vap_active_is_set(vap)) {
++        printk("%s: [%s, %i] vap not active, skipping\n",
++               __func__,
++               vap->iv_netdev_name,
++               avn->av_if_id);
++        return;
++    }
++
+     if ( (IEEE80211_M_HOSTAP == vap->iv_opmode) ||
+          (IEEE80211_M_MONITOR == vap->iv_opmode) ) {
+         avn = OL_ATH_VAP_NET80211(vap);

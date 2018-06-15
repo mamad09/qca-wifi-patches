@@ -1,0 +1,73 @@
+--- a/umac/mlme/ieee80211_mgmt_bss.c
++++ b/umac/mlme/ieee80211_mgmt_bss.c
+@@ -477,33 +477,7 @@ ieee80211_recv_probereq(struct ieee80211
+ 
+         found_null_bssid = 1;
+     }
+-#if ATH_BAND_STEERING
+-    blocked = ieee80211_bsteering_is_probe_resp_wh(vap, wh->i_addr2, rs->rs_rssi);
+-
+-    ieee80211_bsteering_send_probereq_event(vap, wh->i_addr2, rs->rs_rssi, blocked);
+-
+-    /* If band steering is withholding probes (due to steering being in
+-     * progress), return here so that the response is not sent.
+-     */
+-    if (blocked) {
+-        return 0;
+-    }
+ 
+-    /* If band steering wants to withhold the probe response for configured timeout/count,
+-     * to force association with 5G band, check and return without sending probe response.
+-     */
+-    if (ieee80211_bsteering_is_probe_resp_wh_24g(vap, wh->i_addr2, rs->rs_rssi))
+-    {
+-        return 0;
+-    }
+-    /* Ignore probe request from blocked mac address*/
+-    if (!ieee80211_acl_check(vap, wh->i_addr2)) {
+-	return 0;
+-    }
+-#else
+-    // To silence compiler warning about unused variable.
+-    (void) rs;
+-#endif
+     /*
+      * prreq frame format
+      *  [tlv] ssid
+@@ -703,6 +677,36 @@ ieee80211_recv_probereq(struct ieee80211
+     if (mbo && ieee80211_vap_oce_check(vap)) {
+         extractx.oce_sta = ieee80211_oce_capable(mbo);
+     }
++
++#if ATH_BAND_STEERING
++    /* Ignore probe request from blocked mac address*/
++    if (!ieee80211_acl_check(vap, wh->i_addr2)) {
++        goto exit;
++    }
++
++    blocked = ieee80211_bsteering_is_probe_resp_wh(vap, wh->i_addr2, rs->rs_rssi);
++
++    ieee80211_bsteering_send_probereq_event(vap, wh->i_addr2, rs->rs_rssi, blocked);
++
++    /* If band steering is withholding probes (due to steering being in
++     * progress), return here so that the response is not sent.
++     */
++    if (blocked) {
++        goto exit;
++    }
++
++    /* If band steering wants to withhold the probe response for configured timeout/count,
++     * to force association with 5G band, check and return without sending probe response.
++     */
++    if (ieee80211_bsteering_is_probe_resp_wh_24g(vap, wh->i_addr2, rs->rs_rssi))
++    {
++        return 0;
++    }
++#else
++    /* To silence compiler warning about unused variable. */
++    (void) rs;
++#endif
++
+     /*
+      * Skip Probe Requests received while the scan algorithm is setting a new
+      * channel, or while in a foreign channel.

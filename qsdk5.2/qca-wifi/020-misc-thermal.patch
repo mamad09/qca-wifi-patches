@@ -1,0 +1,594 @@
+--- a/hal/ah.h
++++ b/hal/ah.h
+@@ -2628,6 +2628,7 @@ struct ath_hal {
+     u_int8_t __ahdecl(*ah_enable_basic_3wire_btcoex)(struct ath_hal *);
+     u_int8_t __ahdecl(*ah_disable_basic_3wire_btcoex)(struct ath_hal *);
+ #endif
++    int       __ahdecl(*ah_get_therm)(struct ath_hal *ah);
+ #ifdef ATH_SUPPORT_DFS
+     u_int32_t   ah_use_cac_prssi;  /* we may use different PRSSI value during CAC */
+ #endif
+--- a/hal/ar9300/ar9300.h
++++ b/hal/ar9300/ar9300.h
+@@ -1762,6 +1762,7 @@ extern void ar9300_tx99_stop(struct ath_
+ extern HAL_BOOL ar9300_set_ctl_pwr(struct ath_hal *ah, u_int8_t *ctl_array);
+ extern void ar9300_set_txchainmaskopt(struct ath_hal *ah, u_int8_t mask);
+ extern void ar9300_reset_nav(struct ath_hal *ah);
++extern int ar9300_get_therm(struct ath_hal *ah);
+ 
+ #if ATH_BT_COEX_3WIRE_MODE
+ extern u_int8_t ar9300_enable_basic_3wire_btcoex(struct ath_hal *ah);
+--- a/hal/ar9300/ar9300_attach.c
++++ b/hal/ar9300/ar9300_attach.c
+@@ -580,6 +580,7 @@ static const struct ath_hal_private ar93
+         ar9300_enable_basic_3wire_btcoex, /* ah_enable_basic_3wire_btcoex */
+         ar9300_disable_basic_3wire_btcoex, /* ah_disable_basic_3wire_btcoex */
+ #endif
++        .ah_get_therm = ar9300_get_therm,
+     },
+ 
+     ar9300_get_channel_edges,              /* ah_get_channel_edges */
+--- a/hal/ar9300/ar9300_misc.c
++++ b/hal/ar9300/ar9300_misc.c
+@@ -4226,4 +4226,33 @@ int ar9300_adc_data_read(struct ath_hal
+    return j << 2;
+ }
+ #endif
++
++int
++ar9300_get_therm(struct ath_hal *ah)
++{
++	int alpha = -10;
++	int Tcal = 33;
++	int therm;
++	int therm_cal_value = 0;
++	int latest_therm_value;
++
++	if (ah == NULL || AH_PRIVATE(ah)->ah_sh == NULL ) {
++		return -1;
++	}
++
++	if (ar9300_get_power_mode(ah) != HAL_PM_AWAKE) {
++		return -1;
++	}
++
++	latest_therm_value = OS_REG_READ_FIELD(ah, AR_PHY_BB_THERM_ADC_4, AR_PHY_BB_THERM_ADC_4_LATEST_THERM);
++	therm_cal_value  = OS_REG_READ_FIELD(ah, AR_PHY_TPC_18, AR_PHY_TPC_18_THERM_CAL_VALUE);
++	therm = (alpha * (latest_therm_value - therm_cal_value))/10 + Tcal;
++
++	if (therm == -1) {
++		therm = 0;
++	}
++
++	return therm;
++}
++
+ #endif /* AH_SUPPORT_AR9300 */
+--- a/include/ath_dev.h
++++ b/include/ath_dev.h
+@@ -3895,6 +3895,7 @@ struct ath_ops {
+     int         (*get_vap_stats)(ath_dev_t dev, int if_id, struct ath_vap_dev_stats *pStats);
+     u_int32_t   (*get_last_txpower)(ath_node_t node);
+     bool        (*direct_rate_check)(ath_dev_t dev,int val);
++    int         (*get_therm)(ath_dev_t dev, int *therm);
+ 
+ };
+ 
+--- a/lmac/ath_dev/ath_config.c
++++ b/lmac/ath_dev/ath_config.c
+@@ -1405,6 +1405,13 @@ ath_get_config(ath_dev_t dev, ath_param_
+                 *(int *)buff =sc->sc_ieee_ops->get_acs_param(sc->sc_ieee, IEEE80211_ACS_BLOCK_MODE);
+             break;
+ #endif
++        case ATH_PARAM_THERM:
++            {
++                int therm;
++                ic->ic_get_therm(ic, &therm);
++                *(int *)buff = therm;
++            }
++            break;
+         case ATH_PARAM_RADIO_TYPE:
+             *(int *)buff = ic->ic_is_mode_offload(ic);
+             break;
+--- a/lmac/ath_dev/ath_internal.h
++++ b/lmac/ath_dev/ath_internal.h
+@@ -4209,6 +4209,8 @@ extern int16_t ath_hal_getChanNoise(stru
+     ((*(_ah)->ah_set_txchainmaskopt)((_ah), (_mask)))
+ #define ath_hal_reset_nav(_ah) \
+     ((*(_ah)->ah_reset_nav)((_ah)))
++#define ath_hal_get_therm(_ah) \
++    ((*(_ah)->ah_get_therm)((_ah)))
+ 
+ #if ATH_BT_COEX_3WIRE_MODE
+ #define ath_hal_enable_basic_3wire_btcoex(_ah) \
+--- a/lmac/ath_dev/ath_main.c
++++ b/lmac/ath_dev/ath_main.c
+@@ -6960,6 +6960,22 @@ ath_modify_bcn_rate(ath_dev_t dev, int i
+     return false;
+ }
+ 
++static int
++ath_get_therm(ath_dev_t dev, int *therm)
++{
++    struct ath_softc *sc = ATH_DEV_TO_SC(dev);
++
++    ATH_PS_WAKEUP(sc);
++    *therm = ath_hal_get_therm(sc->sc_ah);
++    ATH_PS_SLEEP(sc);
++
++    if (*therm == -1) {
++        return -1;
++    } else {
++        return 0;
++    }
++}
++
+ /*
+  * Callback table for Atheros ARXXXX MACs
+  */
+@@ -7480,6 +7496,7 @@ static const struct ath_ops ath_ar_ops =
+     ath_get_vap_stats,                 /* get_vap_stats */
+     ath_get_last_txpower,                  /* get last data tx power*/
+     ath_rate_check,                   /*direct_rate_check*/
++    .get_therm = ath_get_therm,
+ };
+ 
+ int init_sc_params(struct ath_softc *sc,struct ath_hal *ah)
+--- a/lmac/ath_dev/if_athioctl.h
++++ b/lmac/ath_dev/if_athioctl.h
+@@ -673,6 +673,7 @@ typedef enum {
+ #endif
+     ATH_PARAM_TWICE_ANTENNA_GAIN        = 341,
+     ATH_PARAM_BEST_UL_HYST              = 342,
++    ATH_PARAM_THERM,
+ } ath_param_ID_t;
+ 
+ #define ATH_TX_POWER_SRM 0
+--- a/cmn_dev/dp/inc/cdp_txrx_stats_struct.h
++++ b/cmn_dev/dp/inc/cdp_txrx_stats_struct.h
+@@ -492,6 +492,7 @@ typedef enum _ol_ath_param_t {
+ 	 *  bits 16-31 for count of rx_indication after which batching to start
+ 	 */
+ 	OL_ATH_PARAM_RX_MITIGATION  = 358,
++	OL_ATH_PARAM_THERM,
+ } ol_ath_param_t;
+ 
+ /*
+--- a/offload/os/linux/ol_ath_iw_handler.c
++++ b/offload/os/linux/ol_ath_iw_handler.c
+@@ -998,6 +998,8 @@ static const struct iw_priv_args ol_ath_
+         IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0,         "rx_mitigation" },
+     { OL_ATH_PARAM_RX_MITIGATION | OL_ATH_PARAM_SHIFT,
+         0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,         "g_rx_mitigation" },
++    { OL_ATH_PARAM_THERM|OL_ATH_PARAM_SHIFT,  0,
++        IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,      "get_therm" },
+ };
+ 
+ 
+--- a/offload/wlan/include/ol_if_athvar.h
++++ b/offload/wlan/include/ol_if_athvar.h
+@@ -737,6 +737,9 @@ struct ol_ath_softc_net80211 {
+    int                      enable_statsv2;
+    u_int8_t                 tx_ack_timeout;
+    u_int32_t                rx_mitigation_param;
++   int                      therm;
++   os_timer_t               therm_poll_timer;
++   u_int32_t                therm_poll_interval;
+ };
+ #define OL_ATH_DCS_ENABLE(__arg1, val) ((__arg1) |= (val))
+ #define OL_ATH_DCS_DISABLE(__arg1, val) ((__arg1) &= ~(val))
+--- a/offload/wlan/lmac_offload_if/ol_if_ath.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath.c
+@@ -6916,6 +6916,15 @@ ol_ath_get_bw_nss_mapping(struct ieee802
+     return error;
+ }
+ 
++int
++ol_ath_net80211_get_therm(struct ieee80211com *ic, int * therm)
++{
++    struct ol_ath_softc_net80211 *scn = OL_ATH_SOFTC_NET80211(ic);
++
++    *therm = scn->therm;
++
++    return 0;
++}
+ 
+ int
+ ol_ath_dev_attach(struct ol_ath_softc_net80211 *scn,
+@@ -7109,6 +7118,7 @@ ol_ath_dev_attach(struct ol_ath_softc_ne
+     ic->atf_txbuf_share = 0;
+ #endif
+     ic->ic_tr69_request_process = ol_ath_net80211_tr69_process_request;
++    ic->ic_get_therm = ol_ath_net80211_get_therm;
+     /*
+      * In Offload case 'inactivity' is handled in the firmware.
+      * So override the default function with a different one to handle other timeouts.
+@@ -7842,6 +7852,40 @@ attach_failed:
+ }
+ 
+ int
++ol_ath_pdev_get_temperature_event_handler(ol_scn_t scn,
++                                          u_int8_t *data,
++                                          u_int16_t datalen)
++{
++    int err;
++    int celsius;
++
++    if (scn->therm_poll_interval)
++        OS_SET_TIMER(&scn->therm_poll_timer, scn->therm_poll_interval);
++
++    err = wmi_extract_get_temperature_ev(scn->wmi_handle, data, &celsius);
++    if (err)
++        return -EINVAL;
++
++    scn->therm = celsius;
++
++    return 0;
++}
++
++static
++OS_TIMER_FUNC(ol_ath_therm_poll_timer)
++{
++    struct ol_ath_softc_net80211 *scn;
++
++    OS_GET_TIMER_ARG(scn, struct ol_ath_softc_net80211 *);
++
++    if (!scn->therm_poll_interval)
++        return;
++
++    wmi_unified_get_temperature(scn->wmi_handle);
++    OS_SET_TIMER(&scn->therm_poll_timer, scn->therm_poll_interval);
++}
++
++int
+ ol_ath_attach(u_int16_t devid, struct ol_ath_softc_net80211 *scn,
+               IEEE80211_REG_PARAMETERS *ieee80211_conf_parm,
+               ol_ath_update_fw_config_cb cfg_cb)
+@@ -8140,6 +8184,9 @@ ol_ath_attach(u_int16_t devid, struct ol
+         wmi_unified_register_event_handler(scn->wmi_handle, wmi_pdev_check_cal_version_event_id,
+                                                 ol_ath_pdev_caldata_version_check_event_handler, WMI_RX_UMAC_CTX);
+ 
++        wmi_unified_register_event_handler(scn->wmi_handle, wmi_pdev_temperature_event_id,
++                                                ol_ath_pdev_get_temperature_event_handler, WMI_RX_UMAC_CTX);
++
+ #if OL_ATH_SUPPORT_LED
+         if (scn->target_version == AR9888_REV2_VERSION || scn->target_version == AR9887_REV1_VERSION) {
+             scn->scn_led_gpio = PEREGRINE_LED_GPIO ;
+@@ -8184,6 +8231,14 @@ ol_ath_attach(u_int16_t devid, struct ol
+         }
+ #endif
+ #endif /* OL_ATH_SUPPORT_LED */
++
++        scn->therm = 0;
++        scn->therm_poll_interval = 0; //ms
++        OS_INIT_TIMER(scn->sc_osdev,
++                      &scn->therm_poll_timer,
++                      ol_ath_therm_poll_timer,
++                      (void *)scn,
++                      QDF_TIMER_TYPE_WAKE_APPS);
+     }
+     QDF_PRINT_INFO(QDF_PRINT_IDX_SHARED, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, KERN_INFO"%s() UMAC attach . \n", __func__);
+ #if ATH_SUPPORT_DFS
+--- a/offload/wlan/lmac_offload_if/ol_if_ath_config.c
++++ b/offload/wlan/lmac_offload_if/ol_if_ath_config.c
+@@ -1799,6 +1799,7 @@ ol_ath_get_config_param(struct ol_ath_so
+ 	u_int32_t value = *(u_int32_t *)buff;
+ #endif
+     struct ieee80211com *ic = &scn->sc_ic;
++    int therm;
+ 
+     switch(param)
+     {
+@@ -1959,6 +1960,10 @@ ol_ath_get_config_param(struct ol_ath_so
+             }
+             break;
+ #endif
++        case OL_ATH_PARAM_THERM:
++            ic->ic_get_therm(ic, &therm);
++            *(int *)buff = therm;
++            break;
+         case OL_ATH_PARAM_RESET_OL_STATS:
+             ol_ath_reset_vap_stat(ic);
+             break;
+--- a/offload/wlan/lmac_offload_if/ol_if_vap.c
++++ b/offload/wlan/lmac_offload_if/ol_if_vap.c
+@@ -3408,6 +3408,13 @@ ol_ath_vap_create(struct ieee80211com *i
+     if (opmode == IEEE80211_M_STA)
+         scn->sc_nstavaps++;
+ 
++    if (!scn->therm_poll_interval) {
++        // This is the first vaps, let's kick off therm polling here
++        printk(KERN_INFO "%s: Therm timer is enabled (5GHz)\n", __func__);
++        scn->therm_poll_interval = 5000; // ms
++        OS_SET_TIMER(&scn->therm_poll_timer, 5000); /* start polling after 5 sec */
++    }
++
+     /*
+      * Register the vap setup functions for offload
+      * functions here.
+@@ -3578,6 +3585,13 @@ ol_ath_vap_delete(struct ieee80211vap *v
+     }
+     qdf_spin_unlock(&scn->scn_lock);
+ 
++    if (scn->vdev_count == 0 && scn->therm_poll_interval) {
++        printk("Therm timer is cancelled (5GHz)\n");
++        scn->therm_poll_interval = 0;
++        scn->therm = 0;
++        OS_CANCEL_TIMER(&scn->therm_poll_timer);
++        OS_FREE_TIMER(&scn->therm_poll_timer);
++    }
+ }
+ 
+ /*
+--- a/os/linux/include/ieee80211_ioctl.h
++++ b/os/linux/include/ieee80211_ioctl.h
+@@ -1484,6 +1484,7 @@ enum {
+     IEEE80211_PARAM_DEL_MAC_REJECT_MGMT_FRAME   = 537,  /* del macaddress to reject mgmt pkts */
+     IEEE80211_PARAM_ACTIVITY                    = 538,  /* Percentage of time the radio was unable to tx/rx pkts to/from clients */
+     IEEE80211_PARAM_TXPOW                      = 539,   /* set/get the control frame tx power per vap */
++    IEEE80211_PARAM_THERM,
+ };
+ #define WOW_CUSTOM_PKT_LEN 102
+ #define WOW_SYNC_PATTERN 0xFF
+--- a/os/linux/src/ath_iw_handler.c
++++ b/os/linux/src/ath_iw_handler.c
+@@ -835,6 +835,8 @@ static const struct iw_priv_args ath_iw_
+         IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, 0,    "ul_hyst" },
+     { ATH_PARAM_BEST_UL_HYST | ATH_PARAM_SHIFT,
+         0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,    "g_ul_hyst" },
++    { ATH_PARAM_THERM|ATH_PARAM_SHIFT,  0,
++        IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1,      "get_therm" },
+ };
+ 
+ /******************************************************************************/
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -14337,6 +14337,8 @@ static const struct iw_priv_args ieee802
+ #endif
+     { IEEE80211_PARAM_ACTIVITY,0,
+     IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "g_activity" },
++    { IEEE80211_PARAM_THERM,
++      0, IW_PRIV_TYPE_INT | IW_PRIV_SIZE_FIXED | 1, "get_therm" },
+ };
+ 
+ static const iw_handler ieee80211_handlers[] = {
+--- a/umac/if_lmac/if_ath.c
++++ b/umac/if_lmac/if_ath.c
+@@ -403,6 +403,20 @@ static void ath_net80211_record_chan_inf
+ }
+ #endif
+ 
++static int
++ath_net80211_get_therm(struct ieee80211com *ic, int *therm)
++{
++    struct ath_softc_net80211 *scn = ATH_SOFTC_NET80211(ic);
++
++    if(!ic->ic_is_mode_offload(ic)) {
++        return scn->sc_ops->get_therm(scn->sc_dev, therm);
++    } else {
++        // TODO: get therm from 11ac
++    }
++
++    return 0;
++}
++
+ 
+ static void ath_net80211_cw_interference_handler(ieee80211_handle_t ieee)
+ {
+@@ -1256,6 +1270,13 @@ ath_vap_create(struct ieee80211com *ic,
+             vap
+            );
+ 
++    if (nvaps == 0 && !scn->therm_poll_interval) {
++        // This is the first vaps, let's kick off therm polling here
++        printk(KERN_INFO "%s: Therm timer is enabled (2.4GHz) \n", __func__);
++        scn->therm_poll_interval = 5000; // ms
++        OS_SET_TIMER(&scn->therm_poll_timer, 5000); /* start polling after 5 sec */
++    }
++
+     return vap;
+ }
+ 
+@@ -1274,6 +1295,7 @@ ath_vap_delete(struct ieee80211vap *vap)
+     struct ath_vap_net80211 *avn = ATH_VAP_NET80211(vap);
+     struct ath_softc_net80211 *scn = avn->av_sc;
+     int ret;
++    int nvaps, id_mask = 0;
+ 
+ #ifndef ATH_SUPPORT_HTC
+     KASSERT(ieee80211_vap_active_is_set(vap) == 0, ("vap not stopped"));
+@@ -1394,6 +1416,15 @@ ath_vap_delete(struct ieee80211vap *vap)
+ 
+     /* deregister IEEE80211_DPRINTF control object */
+     ieee80211_dprintf_deregister(vap);
++
++    nvaps = wlan_iterate_vap_list(&scn->sc_ic, ath_vap_iter_vap_create,(void *) &id_mask);
++    if (nvaps == 0 && scn->therm_poll_interval) {
++        printk("Therm timer is cancelled (2.4GHz)\n");
++        scn->therm_poll_interval = 0;
++        scn->therm = 0;
++        OS_CANCEL_TIMER(&scn->therm_poll_timer);
++        OS_FREE_TIMER(&scn->therm_poll_timer);
++    }
+ }
+ 
+ 
+@@ -9119,6 +9150,31 @@ ath_net80211_tx_flush(struct ieee80211co
+     sc->sc_ath_ops.tx_flush(sc);
+ }
+ 
++static
++OS_TIMER_FUNC(ath_therm_poll_timer)
++{
++    struct ath_softc_net80211 *scn;
++    int therm;
++    int ret;
++
++    OS_GET_TIMER_ARG(scn, struct ath_softc_net80211 *);
++
++    if (scn->therm_poll_interval == 0) {
++        printk("therm poll timer is cancelled. Exit\n");
++        return;
++    }
++
++    /* pull chip temperature */
++    ret = scn->sc_ic.ic_get_therm(&scn->sc_ic, &therm);
++    scn->therm = therm;
++
++    if (scn->therm_poll_interval) {
++        OS_SET_TIMER(&scn->therm_poll_timer, scn->therm_poll_interval);
++    }
++
++    return;
++}
++
+ int
+ ath_attach(u_int16_t devid, void *base_addr,
+            struct ath_softc_net80211 *scn,
+@@ -10056,6 +10112,16 @@ ath_attach(u_int16_t devid, void *base_a
+ 
+     ic->ic_bestUL_hyst = BEST_UL_HYST_DEF;
+ 
++    ic->ic_get_therm = ath_net80211_get_therm;
++
++    scn->therm_poll_interval = 0; //ms
++    OS_INIT_TIMER(scn->sc_osdev,
++                  &scn->therm_poll_timer,
++                  ath_therm_poll_timer,
++                  (void *)scn,
++                  QDF_TIMER_TYPE_WAKE_APPS);
++    scn->therm = 0;
++
+     return 0;
+ }
+ 
+--- a/umac/if_lmac/if_athvar.h
++++ b/umac/if_lmac/if_athvar.h
+@@ -144,6 +144,9 @@ struct ath_softc_net80211 {
+ #if UNIFIED_SMARTANTENNA
+     int       enable_smart_antenna_da;        /* Enable Smart antenna for direct attach*/
+ #endif
++	int             therm;
++	os_timer_t      therm_poll_timer;
++	u_int32_t       therm_poll_interval;
+ };
+ #define ATH_SOFTC_NET80211(_ic)     ((struct ath_softc_net80211 *)(_ic))
+ 
+--- a/umac/include/ieee80211_var.h
++++ b/umac/include/ieee80211_var.h
+@@ -1885,6 +1885,7 @@ int (*ic_print_scan_config)(wlan_if_t va
+     u_int8_t                            tx_capture_da;      /* Enable Tx capture for DA radios if monitor mode is enabled */
+     u_int32_t                           ic_chan_utilization;   /* channel utilization statistics */
+     u_int8_t                            ic_bestUL_hyst;
++    int                                 (*ic_get_therm)(struct ieee80211com *ic, int *signal_dbm);
+ } IEEE80211COM, *PIEEE80211COM;
+ 
+ #define BEST_UL_HYST_DEF        10
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -5021,6 +5021,14 @@ int ieee80211_ucfg_getparam(wlan_if_t va
+             *value = 0;
+         }
+ 	break;
++    case IEEE80211_PARAM_THERM:
++    {
++        int therm;
++
++        ic->ic_get_therm(ic, &therm);
++        *value = therm;
++        break;
++    }
+     default:
+         retv = EOPNOTSUPP;
+         break;
+--- a/cmn_dev/wmi/src/wmi_unified_api.c
++++ b/cmn_dev/wmi/src/wmi_unified_api.c
+@@ -6510,3 +6510,15 @@ QDF_STATUS wmi_extract_smartlog_ev(void
+ 
+ 	return QDF_STATUS_E_FAILURE;
+ }
++
++QDF_STATUS wmi_extract_get_temperature_ev(void *wmi_hdl, void *evt_buf,
++		uint32_t *celsius)
++{
++	wmi_unified_t wmi_handle = (wmi_unified_t) wmi_hdl;
++
++	if (wmi_handle->ops->extract_get_temperature_ev)
++		return wmi_handle->ops->extract_get_temperature_ev(wmi_handle,
++				evt_buf, celsius);
++
++	return QDF_STATUS_E_FAILURE;
++}
+--- a/cmn_dev/wmi/src/wmi_unified_non_tlv.c
++++ b/cmn_dev/wmi/src/wmi_unified_non_tlv.c
+@@ -5440,6 +5440,39 @@ send_smart_logging_fatal_cmd_non_tlv(wmi
+ 	return QDF_STATUS_SUCCESS;
+ }
+ 
++QDF_STATUS
++send_get_temperature_cmd_non_tlv(wmi_unified_t wmi_handle)
++{
++	wmi_buf_t buf;
++	int len;
++
++	len = 0;
++	buf = wmi_buf_alloc(wmi_handle, len);
++	if (!buf) {
++		qdf_print("%s:wmi_buf_alloc failed\n", __func__);
++		return QDF_STATUS_E_FAILURE;
++	}
++
++	if (wmi_unified_cmd_send(wmi_handle, buf, len,
++		WMI_PDEV_GET_TEMPERATURE_CMDID)) {
++		wmi_buf_free(buf);
++		return QDF_STATUS_E_FAILURE;
++	}
++
++	return QDF_STATUS_SUCCESS;
++}
++
++static QDF_STATUS extract_get_temperature_ev_non_tlv(
++		wmi_unified_t wmi_handle,
++		void *evt_buf,
++		uint32_t *celsius)
++{
++	wmi_pdev_temperature_event *ev = evt_buf;
++
++	*celsius = ev->temperature_degreeC;
++
++	return QDF_STATUS_SUCCESS;
++}
+ /**
+  * wmi_copy_resource_config_non_tlv() - copy resource configuration function
+  * @param resource_cfg: pointer to resource configuration
+@@ -8291,6 +8324,8 @@ struct wmi_ops non_tlv_ops =  {
+ 	.extract_atf_token_info_ev = extract_atf_token_info_ev_non_tlv,
+ 	.send_wds_entry_list_cmd = send_wds_entry_list_cmd_non_tlv,
+ 	.extract_smartlog_event = extract_smartlog_event_non_tlv,
++	.send_get_temperature_cmd = send_get_temperature_cmd_non_tlv,
++	.extract_get_temperature_ev = extract_get_temperature_ev_non_tlv,
+ 
+ };
+ 
+--- a/cmn_dev/wmi/inc/wmi_unified_priv.h
++++ b/cmn_dev/wmi/inc/wmi_unified_priv.h
+@@ -1191,6 +1191,10 @@ QDF_STATUS (*send_adapt_dwelltime_params
+ 			struct wmi_adaptive_dwelltime_params *dwelltime_params);
+ 
+ QDF_STATUS (*send_wds_entry_list_cmd)(wmi_unified_t wmi_handle);
++
++QDF_STATUS
++(*extract_get_temperature_ev)(wmi_unified_t wmi_handle, void *evt_buf,
++			uint32_t *celsius);
+ };
+ 
+ struct target_abi_version {
+--- a/cmn_dev/wmi/inc/wmi_unified_api.h
++++ b/cmn_dev/wmi/inc/wmi_unified_api.h
+@@ -1316,4 +1316,6 @@ QDF_STATUS wmi_unified_send_smart_loggin
+ QDF_STATUS wmi_extract_smartlog_ev(void *wmi_hdl, void *evt_buf,
+ 			struct wmi_debug_fatal_events_t *ev);
+ 
++QDF_STATUS wmi_extract_get_temperature_ev(void *wmi_hdl, void *evt_buf,
++		uint32_t *celsius);
+ #endif /* _WMI_UNIFIED_API_H_ */

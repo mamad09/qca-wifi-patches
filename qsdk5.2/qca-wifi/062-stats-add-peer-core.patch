@@ -1,0 +1,76 @@
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -4,6 +4,7 @@
+ #include <ps_kapi_survey.h>
+ 
+ struct ieee80211com;
++struct ieee80211_node;
+ struct ieee80211_channel;
+ struct _ieee80211_scan_event;
+ 
+@@ -29,6 +30,7 @@ struct ps_kapi_ctx {
+ 	struct ps_kapi_q_util q_util;
+ 	struct ieee80211_channel *prev_chan;
+ 	spinlock_t lock;
++	u64 next_peer_cookie;
+ 	u64 rx_duration_bss;
+ 	bool cc_old_valid;
+ };
+@@ -41,5 +43,7 @@ int ps_kapi_ioctl(struct net_device *dev
+ 		  struct iw_request_info *info,
+ 		  union iwreq_data *wrqu,
+ 		  char *extra);
++void ps_kapi_peer_init(struct ieee80211com *ic,
++		       struct ieee80211_node *ni);
+ 
+ #endif
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -450,3 +450,16 @@ int ps_kapi_init(struct ps_kapi_ctx *ctx
+ }
+ EXPORT_SYMBOL(ps_kapi_init);
+ 
++void ps_kapi_peer_init(struct ieee80211com *ic,
++		       struct ieee80211_node *ni)
++{
++	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
++
++	/* Note: Locking is assumed to be taken appropriately by the caller. In
++	 * pratice this is in context of ieee80211_node creation which is
++	 * locked properly already.
++	 */
++	ni->ps_kapi_peer_cookie = ctx->next_peer_cookie++;
++}
++EXPORT_SYMBOL(ps_kapi_peer_init);
++
+--- a/umac/base/ieee80211_node.c
++++ b/umac/base/ieee80211_node.c
+@@ -17,6 +17,9 @@
+ #include <if_smart_ant.h>
+ #include <mlme/ieee80211_mlme_priv.h>
+ 
++#include <net/iw_handler.h>
++#include <ps_uapi.h>
++#include <ps_kapi.h>
+ 
+ #if IEEE80211_DEBUG_REFCNT
+ #define TRACENODE_INC(_ni, _func, _line, _file) do {                              \
+@@ -441,6 +444,8 @@ ieee80211_alloc_node(struct ieee80211_no
+ 
+     ieee80211node_clear_whc_rept_info(ni);
+ 
++    ps_kapi_peer_init(ic, ni);
++
+     ieee80211_admctl_init(ni);
+ 
+     /* Add the node into hash table */
+--- a/umac/include/ieee80211_node.h
++++ b/umac/include/ieee80211_node.h
+@@ -561,6 +561,7 @@ typedef struct ieee80211_node {
+ #if UMAC_SUPPORT_FILS
+     u_int8_t    ni_fils_aead_set;      /* Set when FILS AEAD parameters are set */
+ #endif
++    u64 ps_kapi_peer_cookie;
+ } IEEE80211_NODE, *PIEEE80211_NODE;
+ 
+ 

@@ -1,0 +1,39 @@
+GIWSCAN ioctl has limited buffer size of 64KiB
+(limited by 16 bit integer to express length).
+
+This forces drivers to be clever and
+sort/cook/filter results to avoid E2BIG and
+truncating important scan results.
+
+QCA driver attempts to sort results in GIWSCAN
+into 2 hunks: matching vap crypto first followed
+by non matching vap crypto.
+
+The 10.4 driver (compared to 10.2) has regressed
+by prematurely truncating scan results when
+processing hidden ssid scan entry.
+
+SM uses GIWSCAN so neighbor reports were
+smaller than expected and comparing `iwlist xx`
+against `wlanconfig xx list scan` yielded
+significant differences in AP count.
+
+The bug was accompanied by excessive "Restricting
+scan results.." messages in kernel, even in fairly
+clean RF environment (eg. tent, shield{box,room},
+cabled).
+
+The bug has little impact on QCA default behavior
+because wpa_supplicant uses IOCTL_SCAN_RESULTS
+which is not affected by this bug.
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -1974,7 +1974,7 @@ giwscan_cb(void *arg, wlan_scan_entry_t
+     }
+ 
+     /* We ran out of space in the buffer. */
+-    if (last_ev == current_ev) {
++    if (se_ssid != NULL && last_ev == current_ev) {
+         goto toobig;
+     }
+ 

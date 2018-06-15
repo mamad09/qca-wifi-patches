@@ -1,0 +1,332 @@
+--- a/include/ps_kapi.h
++++ b/include/ps_kapi.h
+@@ -4,6 +4,7 @@
+ #include <ps_kapi_survey.h>
+ 
+ DECLARE_EWMA(rx_rssi, 1024, 8)
++DECLARE_EWMA(tx_lag, 1024, 8)
+ 
+ struct ieee80211com;
+ struct ieee80211_node;
+@@ -64,6 +65,11 @@ struct ps_kapi_peer_tx_stats {
+ 		u32 success;
+ 		u32 ppdus;
+ 	} stats[PS_MAX_ALL];
++	struct {
++		struct ewma_tx_lag ave_sojourn_msec;
++		u64 sum_sojourn_msec;
++		u32 num_sojourn_mpdus;
++	} sojourn[PS_MAX_TID];
+ };
+ 
+ void ps_kapi_cc_update(struct ieee80211com *ic);
+@@ -88,5 +94,9 @@ void ps_kapi_peer_tx_stats_collect_ar98x
+ 					  struct ieee80211_node *ni,
+ 					  u32 *ppdu_start,
+ 					  u32 *ppdu_end);
++void ps_kapi_sojourn_collect(struct ieee80211com *ic,
++			     struct ieee80211_node *ni,
++			     int tidno,
++			     unsigned long timestamp);
+ 
+ #endif
+--- a/lmac/ath_dev/ath_desc.h
++++ b/lmac/ath_dev/ath_desc.h
+@@ -130,6 +130,8 @@ struct ath_buf {
+ #if ATH_SUPPORT_IQUE && ATH_SUPPORT_IQUE_EXT
+     u_int32_t               bf_txduration;/* Tx duration of this buf */
+ #endif
++    unsigned long           bf_timestamp;
++    unsigned long           bf_timestamp_valid:1;
+     u_int16_t               bf_avail_buf;
+     u_int16_t               bf_reftxpower;  /* reference tx power */
+     struct ath_buf_state    bf_state;    /* buffer state */
+@@ -147,11 +149,24 @@ struct ath_buf {
+ 
+ typedef TAILQ_HEAD(ath_bufhead_s, ath_buf) ath_bufhead;
+ 
++#define ATH_TX_SOJOURN_COLLECT(sc, an, bf)                  \
++    do {                                                    \
++        struct ath_buf *tbf;                                \
++                                                            \
++        for (tbf = bf; tbf; tbf = tbf->bf_next)             \
++            if (tbf->bf_timestamp_valid)                    \
++                ps_kapi_sojourn_collect(sc->sc_ieee,        \
++                                        an->an_node,        \
++                                        bf->bf_tidno,       \
++                                        tbf->bf_timestamp); \
++    } while (0)
++
+ #define ATH_TXBUF_RESET(_bf, _nmaps) do {       \
+     (_bf)->bf_status = 0;                       \
+     (_bf)->bf_lastbf = NULL;                    \
+     (_bf)->bf_lastfrm = NULL;                   \
+     (_bf)->bf_next = NULL;                      \
++    (_bf)->bf_timestamp_valid = 0;              \
+     (_bf)->bf_avail_buf = _nmaps;               \
+     OS_MEMZERO(&((_bf)->bf_state),              \
+                sizeof(struct ath_buf_state));   \
+--- a/lmac/ath_dev/ath_edma_xmit.c
++++ b/lmac/ath_dev/ath_edma_xmit.c
+@@ -301,6 +301,7 @@ ath_tx_edma_process(ath_dev_t dev)
+                                                          ts.ts_rateindex,
+                                                          bf->bf_nframes,
+                                                          ath_tx_num_badfrms(sc, bf, &ts, txok));
++                    ATH_TX_SOJOURN_COLLECT(sc, an, bf);
+ #ifdef ATH_SUPPORT_VOWEXT
+                     /* FIXME do not care Ospre related issues as on today, keep
+                        this pending until we get to that
+--- a/lmac/ath_dev/ath_xmit.c
++++ b/lmac/ath_dev/ath_xmit.c
+@@ -2807,6 +2807,8 @@ ath_tx_start_dma(wbuf_t wbuf, sg_t *sg,
+ 
+         firstbf->bf_lastfrm = bf;
+         firstbf->bf_ht = txctl->ht;
++        firstbf->bf_timestamp = jiffies;
++        firstbf->bf_timestamp_valid = 1;
+ 
+ #ifdef ATH_SUPPORT_UAPSD
+         if (txctl->isuapsd) {
+@@ -3838,6 +3840,7 @@ ath_tx_processq(struct ath_softc *sc, st
+                                                          ps_ds->ds_txstat.ts_rateindex,
+                                                          bf->bf_nframes,
+                                                          ath_tx_num_badfrms(sc, bf, &ps_ds->ds_txstat, txok));
++                    ATH_TX_SOJOURN_COLLECT(sc, an, bf);
+ #if ATH_SUPPORT_VOWEXT
+                     ath_rate_tx_complete(sc, an,
+                                          isrifs ? bf->bf_rifslast->bf_desc : ds,
+--- a/lmac/ath_dev/ath_xmit_ht.c
++++ b/lmac/ath_dev/ath_xmit_ht.c
+@@ -3932,6 +3932,8 @@ ath_tx_complete_aggr_rifs(struct ath_sof
+                     /* copy descriptor content */
+                     tbf->bf_mpdu = bf_last->bf_mpdu;
+                     tbf->bf_node = bf_last->bf_node;
++                    tbf->bf_timestamp = bf_last->bf_timestamp;
++                    tbf->bf_timestamp_valid = bf_last->bf_timestamp_valid;
+ #ifndef REMOVE_PKT_LOG
+                     tbf->bf_vdata = bf_last->bf_vdata;
+ #endif
+--- a/lmac/ath_dev/ps.c
++++ b/lmac/ath_dev/ps.c
+@@ -496,6 +496,12 @@ static int ps_kapi_ioctl_get_peer_tx_sta
+ 		cmd->u.peer_tx_stats.get.stats[i].success = src->stats[i].success;
+ 		cmd->u.peer_tx_stats.get.stats[i].ppdus = src->stats[i].ppdus;
+ 	}
++
++	for (i = 0; i < ARRAY_SIZE(src->sojourn); i++) {
++		cmd->u.peer_tx_stats.get.sojourn[i].ave_sojourn_msec = ewma_tx_lag_read(&src->sojourn[i].ave_sojourn_msec);
++		cmd->u.peer_tx_stats.get.sojourn[i].sum_sojourn_msec = src->sojourn[i].sum_sojourn_msec;
++		cmd->u.peer_tx_stats.get.sojourn[i].num_sojourn_mpdus = src->sojourn[i].num_sojourn_mpdus;
++	}
+ 	spin_unlock_irqrestore(&ctx->lock, flags2);
+ 
+ 	err = 0;
+@@ -592,6 +598,7 @@ void ps_kapi_peer_init(struct ieee80211c
+ {
+ 	struct ps_kapi_ctx *ctx = &ic->ps_kapi_ctx;
+ 	struct ps_kapi_peer_rx_stats *rxs = &ni->ps_kapi_peer_rx_stats;
++	struct ps_kapi_peer_tx_stats *txs = &ni->ps_kapi_peer_tx_stats;
+ 	int i;
+ 	int j;
+ 	int k;
+@@ -608,6 +615,9 @@ void ps_kapi_peer_init(struct ieee80211c
+ 			for (k = 0; k < PS_MAX_RSSI_HT; k++)
+ 				ewma_rx_rssi_init(&rxs->stats[i].ave_rssi_ant[j][k]);
+ 	}
++
++	for (i = 0; i < ARRAY_SIZE(txs->sojourn); i++)
++		ewma_tx_lag_init(&txs->sojourn[i].ave_sojourn_msec);
+ }
+ EXPORT_SYMBOL(ps_kapi_peer_init);
+ 
+@@ -894,3 +904,29 @@ unlock:
+ 	spin_unlock_irqrestore(&ctx->lock, flags);
+ }
+ EXPORT_SYMBOL(ps_kapi_peer_tx_stats_collect_ar98xx);
++
++void ps_kapi_sojourn_collect(struct ieee80211com *ic,
++			     struct ieee80211_node *ni,
++			     int tidno,
++			     unsigned long timestamp)
++{
++	struct ps_kapi_ctx *ctx;
++	unsigned long flags;
++	unsigned long delta_ms;
++
++
++	if (tidno >= ARRAY_SIZE(ni->ps_kapi_peer_tx_stats.sojourn))
++		tidno = 0;
++
++	ctx = &ic->ps_kapi_ctx;
++	delta_ms = jiffies_to_msecs(jiffies - timestamp);
++
++	spin_lock_irqsave(&ctx->lock, flags);
++
++	ewma_tx_lag_add(&ni->ps_kapi_peer_tx_stats.sojourn[tidno].ave_sojourn_msec, delta_ms);
++	ni->ps_kapi_peer_tx_stats.sojourn[tidno].sum_sojourn_msec += delta_ms;
++	ni->ps_kapi_peer_tx_stats.sojourn[tidno].num_sojourn_mpdus++;
++
++	spin_unlock_irqrestore(&ctx->lock, flags);
++}
++EXPORT_SYMBOL(ps_kapi_sojourn_collect);
+--- a/offload/wlan/txrx/include/ol_txrx_types.h
++++ b/offload/wlan/txrx/include/ol_txrx_types.h
+@@ -287,6 +287,8 @@ struct ol_tx_desc_t {
+ #if MESH_MODE_SUPPORT
+     u_int16_t extnd_desc;
+ #endif
++    unsigned long timestamp;
++    unsigned long timestamp_valid:1;
+ };
+ 
+ typedef TAILQ_HEAD(, ol_tx_desc_t) ol_tx_desc_list;
+--- a/offload/wlan/txrx/ol_tx.c
++++ b/offload/wlan/txrx/ol_tx.c
+@@ -1125,6 +1125,8 @@ uint32_t ol_tx_prepare_ll_fast(struct ol
+     struct meta_hdr_s *mhdr;
+ #endif
+ 
++    tx_desc->timestamp = jiffies;
++    tx_desc->timestamp_valid = 1;
+     tx_desc->netbuf = nbuf;
+     tx_desc->tx_encap_type = vdev->tx_encap_type;
+ #if MESH_MODE_SUPPORT
+@@ -1688,6 +1690,8 @@ ol_tx_ll_cachedhdr_prep(ol_txrx_vdev_han
+     struct meta_hdr_s *mhdr;
+ #endif
+ 
++    tx_desc->timestamp = jiffies;
++    tx_desc->timestamp_valid = 1;
+     tx_desc->netbuf = netbuf;
+     tx_desc->tx_encap_type = vdev->tx_encap_type;
+     tx_desc->pkt_type = ol_tx_frm_std;
+--- a/offload/wlan/txrx/ol_tx_desc.c
++++ b/offload/wlan/txrx/ol_tx_desc.c
+@@ -40,6 +40,9 @@ do {
+     tx_desc = ol_tx_desc_alloc(pdev);                       \
+     if (!tx_desc) return NULL;                              \
+                                                             \
++    tx_desc->timestamp = jiffies;                           \
++    tx_desc->timestamp_valid = 1;                           \
++                                                            \
+     /* initialize the SW tx descriptor */                   \
+     tx_desc->netbuf = netbuf;                               \
+     tx_desc->pkt_type = ol_tx_frm_std;                      \
+--- a/offload/wlan/txrx/ol_tx_send.c
++++ b/offload/wlan/txrx/ol_tx_send.c
+@@ -19,6 +19,8 @@
+ #include <ol_txrx_internal.h>
+ #include <ol_if_athvar.h>
+ #include <ol_rawmode_txrx_api.h> /* OL_RAW_TX_CHAINED_NBUF_UNMAP */
++#include <ol_txrx.h>
++#include <ol_txrx_peer_find.h>
+ 
+ #include <ol_cfg.h>          /* ol_cfg_is_high_latency */
+ #if QCA_OL_TX_CACHEDHDR
+@@ -412,6 +414,53 @@ void populate_tx_info(struct ol_ath_soft
+ }
+ #endif  /*end of ATH_DATA_TX_INFO_EN*/
+ 
++static void
++ol_tx_sojourn_collect(ol_txrx_pdev_handle pdev,
++                      struct ol_ath_softc_net80211 *scn,
++                      struct ol_tx_desc_t *tx_desc,
++                      qdf_nbuf_t netbuf)
++{
++    struct ieee80211vap *vap;
++    struct ieee80211_node *ni;
++    struct ol_txrx_peer_t *peer;
++    int tidno;
++
++    if (!scn->scn_stats.ap_stats_tx_cal_enable)
++        return;
++
++    if (!tx_desc->timestamp_valid)
++        return;
++
++    if (pdev->tx_stats.peer_id == HTT_INVALID_PEER)
++        return;
++
++    peer = ol_txrx_get_peer_by_id(pdev, pdev->tx_stats.peer_id);
++    if (!peer)
++        return;
++
++    if (!peer->vdev)
++        goto unref_peer;
++
++    vap = ol_ath_vap_get(scn, peer->vdev->vdev_id);
++    if (!vap)
++        goto unref_peer;
++
++    ni = ieee80211_vap_find_node(vap, peer->mac_addr.raw);
++    if (!ni)
++        goto unref_peer;
++
++    tidno = qdf_nbuf_get_tid(netbuf);
++    ps_kapi_sojourn_collect(&scn->sc_ic,
++                            ni,
++                            tidno,
++                            tx_desc->timestamp);
++
++    ieee80211_free_node(ni);
++
++unref_peer:
++    ol_txrx_peer_unref_delete(peer);
++}
++
+ /* WARNING: ol_tx_inspect_handler()'s bahavior is similar to that of ol_tx_completion_handler().
+  * any change in ol_tx_completion_handler() must be mirrored in ol_tx_inspect_handler().
+  */
+@@ -586,6 +635,8 @@ ol_tx_completion_handler(
+                     }
+                 }
+             }
++
++            ol_tx_sojourn_collect(pdev, scn, tx_desc, netbuf);
+             ol_tx_msdu_complete(pdev, tx_desc, tx_descs, netbuf, lcl_freelist,
+                                     tx_desc_last, status, *num_htt_compl);
+         }
+--- a/os/linux/src/ieee80211_aponly.c
++++ b/os/linux/src/ieee80211_aponly.c
+@@ -800,6 +800,8 @@ ath_tx_complete_aggr_rifs_aponly(struct
+                     /* copy descriptor content */
+                     tbf->bf_mpdu = bf_last->bf_mpdu;
+                     tbf->bf_node = bf_last->bf_node;
++                    tbf->bf_timestamp = bf_last->bf_timestamp;
++                    tbf->bf_timestamp_valid = bf_last->bf_timestamp_valid;
+ #ifndef REMOVE_PKT_LOG
+                     tbf->bf_vdata = bf_last->bf_vdata;
+ #endif
+@@ -1170,6 +1172,7 @@ ath_tx_processq_aponly(struct ath_softc
+                                                          ps_ds->ds_txstat.ts_rateindex,
+                                                          bf->bf_nframes,
+                                                          ath_tx_num_badfrms(sc, bf, &ps_ds->ds_txstat, txok));
++                    ATH_TX_SOJOURN_COLLECT(sc, an, bf);
+ #if ATH_SUPPORT_VOWEXT
+                     ath_rate_tx_complete(sc, an,
+                                          isrifs ? bf->bf_rifslast->bf_desc : ds,
+@@ -2019,6 +2022,7 @@ ath_tx_edma_tasklet_compact(ath_dev_t de
+                                                          ts.ts_rateindex,
+                                                          bf->bf_nframes,
+                                                          ath_tx_num_badfrms(sc, bf, &ts, txok));
++                    ATH_TX_SOJOURN_COLLECT(sc, an, bf);
+ #if ATH_SUPPORT_VOWEXT
+                     /* FIXME do not care Ospre related issues as on today, keep
+                        this pending until we get to that
+@@ -2392,6 +2396,7 @@ ath_tx_edma_tasklet_aponly(ath_dev_t dev
+                                                          ts.ts_rateindex,
+                                                          bf->bf_nframes,
+                                                          ath_tx_num_badfrms(sc, bf, &ts, txok));
++                    ATH_TX_SOJOURN_COLLECT(sc, an, bf);
+ #ifdef ATH_SUPPORT_VOWEXT
+ 
+                     /* FIXME do not care Ospre related issues as on today, keep
+@@ -6917,6 +6922,8 @@ ath_tx_start_dma_aponly(wbuf_t wbuf, sg_
+ 
+         firstbf->bf_lastfrm = bf;
+         firstbf->bf_ht = txctl->ht;
++        firstbf->bf_timestamp = jiffies;
++        firstbf->bf_timestamp_valid = 1;
+ #ifdef ATH_SUPPORT_UAPSD
+         if (txctl->isuapsd) {
+             ath_tx_queue_uapsd(sc, txq, &bf_head, txctl);

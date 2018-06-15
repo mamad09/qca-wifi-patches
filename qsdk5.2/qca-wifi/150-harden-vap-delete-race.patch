@@ -1,0 +1,36 @@
+A crash was observed in the field (PIR-7839):
+
+ <4>[2822467.040000] Unhandled kernel unaligned access1:
+ <4>[2822467.040000] $ 0 : 00000000 00000000 a836da00 00000001
+ <4>[2822467.040000] $ 4 : 602646de 85d16a5c 00000004 8554a414
+ <4>[2822467.040000] $ 8 : 00000061 00000001 00000003 77652e70
+ <4>[2822467.040000] epc : 8545e190 ieee80211_scan_entry_age+0x8/0x14 [umac]
+ <4>[2822467.040000] ra : 8545f0cc ieee80211_scan_table_iterate+0x4c/0xb4 [umac]
+ <4>[2822467.040000] BadVA : 6026472e
+ <4>[2822467.040000] Call Trace:
+ <4>[2822467.040000] [<8545e190>] ieee80211_scan_entry_age+0x8/0x14 [umac]
+ <4>[2822467.040000] [<8545f0cc>] ieee80211_scan_table_iterate+0x4c/0xb4 [umac]
+ <4>[2822467.040000] [<8548cb1c>] ieee80211_ioctl_getmode+0x59f8/0x5dc4 [umac]
+
+From the looks of it it seems like use-after-free
+due to a race. Scan vtable can be removed from
+within ieee80211_state_event(), i.e. outside of
+ioctl context with which it is theorized the race
+happens against (giwscan in particular).
+
+This is hardly a proper fix since it can (and
+will) race. It should reduce the chance of it
+crashing though.
+only in patch2:
+unchanged:
+--- a/os/linux/src/ieee80211_wireless.c
++++ b/os/linux/src/ieee80211_wireless.c
+@@ -2477,6 +2477,8 @@ ieee80211_ioctl_giwscan(struct net_devic
+     int count, i;
+     int time_elapsed = OS_SIWSCAN_TIMEOUT;
+ 
++    if (osifp->is_delete_in_progress)
++        return -EINVAL;
+ 
+     /* Increase timeout value for EIR since a rpt scan itself takes 12 seconds */
+     if (ieee80211_ic_enh_ind_rpt_is_set(vap->iv_ic))

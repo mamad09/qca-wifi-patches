@@ -1,0 +1,41 @@
+Wireless netlink events do carry interface name.
+It was never parsed because it was never used.
+
+Some of plume patches will use it though and it
+makes little sense to bundle this very change
+along with the "user", since there may be multiple
+users in the future and it'll be easier to
+maintain if it's split from the start.
+--- a/os/linux/tools/wifitool.c
++++ b/os/linux/tools/wifitool.c
+@@ -2050,6 +2050,7 @@ get_next_wireless_custom_event(void *eve
+     socklen_t fromlen;
+     int len;
+     char buf[8192];
++    char ifname[32];
+     struct nlmsghdr *h;
+     int done, count;
+     fd_set r;
+@@ -2071,6 +2072,7 @@ get_next_wireless_custom_event(void *eve
+         return NULL;
+     }
+ 
++    ifname[0] = 0;
+     count = 0;
+     do {
+         done = 0;
+@@ -2115,6 +2117,14 @@ get_next_wireless_custom_event(void *eve
+                     struct iw_event iwe;
+                     char *start;
+                     char *end;
++                    if (attr->rta_type == IFLA_IFNAME) {
++                        int ilen;
++                        ilen = attr->rta_len - rlen;
++                        if (ilen > sizeof(ifname) - 1)
++                            ilen = sizeof(ifname) - 1;
++                        memcpy(ifname, RTA_DATA(attr), ilen);
++                        ifname[ilen] = 0;
++                    }
+                     if (attr->rta_type != IFLA_WIRELESS) {
+                         attr = RTA_NEXT(attr, attrlen);
+                         continue;

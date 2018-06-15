@@ -1,0 +1,61 @@
+Driver stores HT40/VHT40 secondary channel
+placement explicitly in channel flags and hence
+plus and minus variants are treated as distinct,
+non-matching channels.
+
+When CSA ioctl was requested with chwidth=0 when
+switching from ch1 HT40+ to ch11 HT40+ it would
+fail because ch11 HT40+ is not allowed (secondary
+channel would be out of regulatory and radio
+bounds) and the code didn't attempt to try
+swapping secondary channel.
+
+This problem happened exclusively on 2.4GHz
+because it's using HT40 while 5GHz uses VHT80
+which doesn't store secondary channel placement in
+channel flags.
+
+The patch introduces implicit primary <->
+secondary channel swap for HT40 and VHT40 CSA, if
+necessary.
+--- a/umac/base/ieee80211_ucfg.c
++++ b/umac/base/ieee80211_ucfg.c
+@@ -400,6 +400,19 @@ int ieee80211_ucfg_set_freq_internal(wla
+     }
+ }
+ 
++static u_int32_t ieee80211_ucfg_swap_pri_sec(u_int32_t flags)
++{
++    const u_int32_t vht40 = IEEE80211_CHAN_VHT40PLUS | IEEE80211_CHAN_VHT40MINUS;
++    const u_int32_t ht40 = IEEE80211_CHAN_HT40PLUS | IEEE80211_CHAN_HT40MINUS;
++
++    if (flags & vht40)
++        flags ^= vht40;
++    else if (flags & ht40)
++        flags ^= ht40;
++
++    return flags;
++}
++
+ int ieee80211_ucfg_set_chanswitch(wlan_if_t vaphandle, u_int8_t chan, u_int8_t tbtt, u_int16_t ch_width)
+ {
+     struct ieee80211vap *vap = vaphandle;
+@@ -422,10 +435,14 @@ int ieee80211_ucfg_set_chanswitch(wlan_i
+     ic->ic_chanchange_channel = NULL;
+ 
+     if ((ch_width == 0) &&(ieee80211_find_channel(ic, freq, 0, ic->ic_curchan->ic_flags) == NULL)) {
+-        /* Switching between different modes is not allowed, print ERROR */
+-        QDF_PRINT_INFO(ic->ic_print_idx, QDF_MODULE_ID_ANY, QDF_TRACE_LEVEL_INFO, "%s(): Channel capabilities do not match, chan flags 0x%x\n",
+-            __func__, ic->ic_curchan->ic_flags);
+-        return -EINVAL;
++        flags = ieee80211_ucfg_swap_pri_sec(ic->ic_curchan->ic_flags);
++        ic->ic_chanchange_channel = ieee80211_find_channel(ic, freq, 0, flags);
++
++        if (!ic->ic_chanchange_channel) {
++            printk("%s(): Channel capabilities do not match, chan flags 0x%x\n",
++                __func__, ic->ic_curchan->ic_flags);
++            return -EINVAL;
++        }
+     } else {
+         if(ch_width != 0){
+           /* Set channel, chanflag, channel width from ch_width value */
