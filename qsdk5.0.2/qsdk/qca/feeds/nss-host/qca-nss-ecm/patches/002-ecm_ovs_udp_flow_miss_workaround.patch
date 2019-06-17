@@ -20,15 +20,16 @@ connection flow. Afterwards the hierarchy construction would succeed.
  {
  	int protocol;
  	ip_addr_t src_addr;
-@@ -3693,14 +3694,37 @@ int32_t ecm_interface_heirarchy_construc
+@@ -3693,15 +3694,43 @@ int32_t ecm_interface_heirarchy_construc
  				if (!ovs_internal_dev_cnt && ovs_is_internal_dev(dest_dev)) {
  					struct net_device *outer_dev = NULL;
  					uint8_t mac_addr[ETH_ALEN];
 +					ip_addr_t gw_addr = ECM_IP_ADDR_NULL;
 +					bool on_link = false;
++					bool not_found = false;
  
  					ovs_internal_dev_cnt = 1;
- 					memset(mac_addr, 0, ETH_ALEN);
+-					memset(mac_addr, 0, ETH_ALEN);
 -					if (ecm_interface_multicast_get_next_node_mac_address(next_dest_addr, dest_dev, ip_version, mac_addr)) {
 +					if (likely(ecm_interface_mac_addr_get(next_dest_addr, mac_addr, &on_link, gw_addr))) {
  						outer_dev = ovs_port_dev_get(dest_dev, mac_addr, ip_version, NULL);
@@ -36,29 +37,35 @@ connection flow. Afterwards the hierarchy construction would succeed.
  			   				next_dev = outer_dev;
  							dev_hold(next_dev);
 +						} else {
-+							if (force_search) {
-+								//printk("Unable to obtain outer interface for: %pM\n", mac_addr);
-+								/* send ARP request to revnew the flow table */
-+								if (ip_version == 4) {
-+									ecm_interface_send_arp_request(dest_dev, next_dest_addr, on_link, gw_addr);
-+								}
-+#ifdef ECM_IPV6_ENABLE
-+								else if (ip_version == 6) {
-+									ecm_interface_send_neighbour_solicitation(dest_dev, next_dest_addr);
-+								}
-+#endif
-+								dev_put(src_dev);
-+								dev_put(dest_dev);
-+
-+								/*
-+								 * Release the interfaces heirarchy we constructed to this point.
-+								 */
-+								ecm_db_connection_interfaces_deref(interfaces, current_interface_index);
-+								return ECM_DB_IFACE_HEIRARCHY_MAX;
-+							}
++							if (force_search)
++								not_found = true;
  						}
++					} else {
++						not_found = true;
++					}
++
++					if (not_found) {
++						//printk("Unable to obtain outer interface for: %pM\n", mac_addr);
++						/* send ARP request to revnew the flow table */
++						if (ip_version == 4) {
++							ecm_interface_send_arp_request(dest_dev, next_dest_addr, on_link, gw_addr);
++						}
++#ifdef ECM_IPV6_ENABLE
++						else if (ip_version == 6) {
++							ecm_interface_send_neighbour_solicitation(dest_dev, next_dest_addr);
++						}
++#endif
++						dev_put(src_dev);
++						dev_put(dest_dev);
++
++						/*
++						 * Release the interfaces heirarchy we constructed to this point.
++						 */
++						ecm_db_connection_interfaces_deref(interfaces, current_interface_index);
++						return ECM_DB_IFACE_HEIRARCHY_MAX;
  					}
  				}
+ 
 --- a/ecm_interface.h
 +++ b/ecm_interface.h
 @@ -96,7 +96,8 @@ int32_t ecm_interface_heirarchy_construc
