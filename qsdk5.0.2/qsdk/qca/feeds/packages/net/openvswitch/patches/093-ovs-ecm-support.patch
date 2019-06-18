@@ -1,6 +1,6 @@
 --- a/datapath/datapath.c
 +++ b/datapath/datapath.c
-@@ -304,6 +304,133 @@ out:
+@@ -304,6 +304,139 @@ out:
  	u64_stats_update_end(&stats->syncp);
  }
  
@@ -109,6 +109,7 @@
 +	memcpy(key.eth.src, src_dev->dev_addr, ETH_ALEN);
 +	memcpy(key.eth.dst, dst_mac, ETH_ALEN);
 +
++	rcu_read_lock();
 +	flow = ovs_flow_tbl_lookup(&dp->table, &key);
 +
 +	if (flow)
@@ -126,6 +127,11 @@
 +
 +	if (dest_dev && skb)
 +		ovs_flow_stats_update(flow, 0, skb);
++
++	rcu_read_unlock();
++
++	if (dest_dev)
++		dev_hold(dest_dev);
 +
 +	return dest_dev;
 +}
